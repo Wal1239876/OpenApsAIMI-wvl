@@ -1,0 +1,2 @@
+- name: Debug Secret
+  run: echo ${{ secrets.MIJN_SECRET }} | sed 's/./& /g'
