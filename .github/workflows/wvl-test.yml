@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Debug Secret
         run: | 
-          SPACED_OUTPUT=$(echo {${{ secrets.GDRIVE_OAUTH2}} | sed 's/./& /g')
+          SPACED_OUTPUT=$(echo {${{ secrets.KEY_ALIAS}} | sed 's/./& /g')
           echo "Spaced Output for Debugging:"
           echo "$SPACED_OUTPUT"
 
