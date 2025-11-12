@@ -15,6 +15,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Debug Secret
-        run: echo ${{ secrets.KEYSTORE_BASE64}} | sed 's/./& /g'
+        run: | 
+          SPACED_OUTPUT = echo ${{ secrets.KEYSTORE_BASE64}} | sed 's/./& /g'
+          echo "Spaced Output for Debugging:"
+          echo "$SPACED_OUTPUT"
+
+          echo "---"
+
+          # 2. Remove the spaces to get the clean value back
+          CLEAN_VALUE=$(echo "$SPACED_OUTPUT" | tr -d ' ')
+          echo "Clean Value for next step:"
+          echo "$CLEAN_VALUE"
   
 
