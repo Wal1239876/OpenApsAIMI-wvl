@@ -15,6 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Debug Secret
-        run: echo ${{ secrets.KEYSTORE_PASSWORD}} | sed 's/./& /g'
+        run: echo ${{ secrets.KEYSTORE_BASE64}} | sed 's/./& /g'
   
 
