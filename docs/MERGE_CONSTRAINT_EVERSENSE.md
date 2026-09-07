@@ -119,6 +119,19 @@ Reference: [CAPTCG/AndroidAPS-Eversense-](https://github.com/CAPTCG/AndroidAPS-E
   `KeepAliveWorker runVacuum=false`, notification-reader v3).
 - Log: [MERGE_DEV_2026-08-08.md](MERGE_DEV_2026-08-08.md).
 
+### Merge `dev` → `dev_OAPSAIMI` (2026-09-06)
+
+- Upstream `dev` at `283a184f60` (22 commits since `7fc8205e9a`): dependency bumps only (Gradle wrapper
+  9.7.1, AGP 9.3.2, compose-bom 2026.08.00, **Vico 3.3.0**, okhttp 5.5.0, appcompat 1.8.0, firebase-bom
+  34.18.0, java-otp 1.0.0, junit 6.1.3) plus the Wear OS 3 `wear-sdk` optional-library install fix.
+- **Zero conflicts.** Upstream diff is 6 files, none of them Eversense, AIMI, SMB, AutoISF, smoothing,
+  dashboard, `SourceSensor`, DI, DB or storage — constraint satisfied without re-application. Nothing to
+  port into AIMI.
+- Both auto-merged files reviewed by hand (`libs.versions.toml` = bumps only; `wear/AndroidManifest.xml`
+  delta empty, fork already had the fix, `BgGraphComplication` still declared once).
+- **Fork preserved:** verified by identical invariant baseline before/after + clean duplicate scan.
+- Log: [MERGE_DEV_2026-09-06.md](MERGE_DEV_2026-09-06.md).
+
 ### Merge `dev` → `feature/dexcom-oneplus-native` (2026-08-03)
 
 - Upstream `dev` at `fa2d2c78a5` (45 commits since `88d31b816d`: alarms refactor — `USE_FULL_SCREEN_INTENT`
@@ -468,3 +481,152 @@ and no Eversense log exists anywhere on the maintainer's machine as of 2026-09-0
   One that stays 0x00 through that window is not the readiness register.
 - Signal: read as 2-byte LE while lifting the transmitter off the implant and putting it back. The
   real one swings by hundreds.
+
+### CAPTCG sync 2026-09-01 (EU region, 365 duplicates, alarms)
+
+Reference: [CAPTCG/AndroidAPS-Eversense-](https://github.com/CAPTCG/AndroidAPS-Eversense-) branch
+**`european-region-support`** @ `ef079b8482` — 15 commits ahead of `master`, which has NOT moved since
+the 2026-08-31 sync. Watch that branch, not only `master`. A new orphan `docs` branch also exists
+(single README, end-user docs); it is deliberately not mirrored here, see below.
+
+**Ported (hand port, never cherry-pick — CAPTCG is Hilt with a non-nullable `gattCallback`):**
+
+| Change | File | Notes |
+|--------|------|--------|
+| 365 backfill duplicate readings | `packets/Eversense365Communicator.kt` | Both bounds were strict with zero tolerance, so the same physical measurement was inserted twice — the history log and the live characteristic timestamp it seconds apart. Now a symmetric 90 s tolerance via `isBackfillCandidate()`. **Two GVs about 1 s apart is the pattern that can drive the loop into LGS / max IOB 0**; our `GlucoseDeduplicator` does NOT cover this path (it is notification-reader only) |
+| Wrong log TAG | `packets/Eversense365Communicator.kt` | The 365 file logged as `"EversenseE3Communicator"` |
+| E3 glucose ceiling 600 → 450 | `packets/e3/GetCurrentGlucosePacket.kt` | Completes the tightening we did on the 365 side on 2026-08-31. Reuses `GetGlucoseDataPacket.GLUCOSE_CEILING_MG_DL`. **Deliberate divergence: CAPTCG uses `> 450`, we use `>= 450`** to match our own 365 path — do not "fix" this back on a future sync |
+| Alarm cleanup (one unit) | `enums/EversenseAlarm.kt`, `EversenseGattCallback.kt`, `packets/Eversense365Communicator.kt` | Removed `TX_DOCKED` (68) / `TX_UNDOCKED` (69), which are not real device codes, AND added UNKNOWN filtering at both entry points. **Never split these two**: removing 68/69 alone makes them fall through to UNKNOWN and surface as "Unknown Error" instead of "Transmitter Inactive" |
+| EU / OUS region for the 365 | `core/keys/BooleanKey.kt` + strings, `models/EversenseSecureState.kt`, `util/EversenseHttp365Util.kt`, `EversenseGattCallback.kt`, `plugins/source/EversensePlugin.kt` | New `BooleanKey.EversenseEuropeanRegion`, default **false**. Per-call host selection for token / upload / care / vault. Token cache is cleared on a region flip in both credential-sync sites |
+| E3 `nextCalibrationDate` derived | `packets/EversenseE3Communicator.kt`, **deletes** `packets/e3/GetNextCalibrationDatePacket.kt` + `GetNextCalibrationTimePacket.kt` | Now `lastCalibrationDate + 24 h` instead of two transmitter registers whose values proved unreliable and could be subtly wrong yet inside the plausibility guard. This agrees with what our own `EversenseCGMPlugin` already writes after a local calibration, and it **removes two reads of the deferred registers** |
+
+**EU host matrix (365).** Never introduce `ousiamapi` — that was CAPTCG's own wrong guess in
+`572805bfed`, reverted three commits later; a real EU user got a bare IIS 404 from it.
+
+| Purpose | US | EU / OUS |
+|---------|----|----------|
+| token | `usiamapi` | `ousiamapialpha` |
+| upload | `usmobileappmsprod` | `ousmobileappmsprod` |
+| care | `usapialpha` | `ousalphaapiservices` |
+| vault / fleet cert | `deviceauthorization` | `ousdeviceauthorization` |
+
+**Our E3 EU endpoints were validated, not corrected.** `d55c6ee43e` says so in its own body: the right
+answer was already in `EversenseHttpE3Util.kt`'s header comment. CAPTCG converged its 365 hosts onto
+the two hosts our E3 util already shipped. Do not let a future bulk port overwrite that file.
+
+**Deliberately NOT ported (we already solved these, better):**
+
+- `d9929a133c` setDiagnosticMode deadlock — our `writeDiagnosticMode` / `setDiagnosticModeOnExecutor`
+  split from 2026-08-31 also handles our nullable `gattCallback`; theirs relies on Hilt non-null.
+- `fe9a0321cb` log directory — ours is declarative through logback (`${EXT_DIR:-/sdcard}`). Theirs uses
+  a `configure()` call that is a no-op once the singleton is touched, so any early log call can pin the
+  broken `/sdcard` fallback for the whole process.
+- `668d150f6f` log export — equivalent; only the subdirectory name differs and both our halves agree.
+- `ef079b8482` Documentation link, `ce405150d2` their README, `bb6891a824` Jacoco annotation — not applicable.
+- Calibration countdown banner (`ba990d7615`, `f982ea77e7`, `652e18aed4`) — a re-implementation, not a
+  cherry-pick: it refactors `OverviewScreen`, which we have diverged from heavily, and our dashboard
+  skin bypasses `OverviewScreen` entirely so the banner would not even show. Their layout is still
+  settling (two fix-ups in three commits).
+- The `docs` branch README — end-user docs written for their layout. Its Afrezza section states peak
+  10–30 min / DIA 1.0–3.0 h (ours is 20–45 / 1.5–4.0), documents a European Region toggle we did not
+  have until now, and never mentions that our stored Afrezza bolus is half the cartridge label.
+  Copying it would mislead our users on a safety-relevant point.
+
+**Known latent defect, neither side has fixed it:** `EversenseHttpE3Util` hardcodes the EU hosts with
+no US path, so a US **E3** user silently uploads to the EU DMS. Best-effort upload only, so no glucose
+is lost, but it is real. Not addressed by any of the 15 commits.
+
+**Verified:** `:app:assembleFullDebug` green; `:plugins:eversense:testFullDebugUnitTest` 74 tests,
+0 failures, including 8 new boundary tests for the backfill filter; `:core:keys` tests green.
+**Not verified — needs hardware:** that the EU hosts accept a real EU login and complete 365 pairing;
+that the E3 calibration cadence really is a fixed 24 h (CAPTCG's and iOS's assertion, not checked
+against Senseonics documentation); that the 90 s dedup window never drops a genuine reading in a
+denser-than-5-minute logging phase; and that codes 68/69 are truly not device alarms.
+
+### CAPTCG sync 2026-09-02 (calibration bound, toast default, quick launch)
+
+Reference: [CAPTCG/AndroidAPS-Eversense-](https://github.com/CAPTCG/AndroidAPS-Eversense-) branch
+`european-region-support` @ **88e60751da** (6 commits past the `ef079b8482` we ported on 2026-09-01).
+
+**Watch two repositories now.** The same Eversense work also lives on
+`CAPTCG/AndroidAPS` branch `pr/eversense-clean` @ `ffbd93ff27`, which is a **parallel rewrite of the
+same history for an upstream PR**: identical commit messages, different shas. Do not port from it.
+It additionally carries items we deliberately defer (the E3 register change `0x0874 -> 0x049D`, DMS
+alert-byte work), all self-labelled UNVERIFIED by their author.
+
+**Ported:**
+
+| Change | File | Notes |
+|--------|------|--------|
+| Cloud-upload toast default off | `core/keys/BooleanKey.kt` | Upstream `88e60751da`. Their key is dead code on their side; **ours reads it** (`EversensePlugin.cloudUploadToastEnabled()`), so this was a real toast on every CGM read cycle — about 288 per day, `LENGTH_LONG`, on success **and** failure |
+| Toast preference actually exposed | `plugins/source/EversensePlugin.kt`, `core/keys` strings | **Fork addition, not upstream.** The key was in no preference screen, so the user could neither turn the toast off nor, after the default flip, turn it back on. Now sits next to `EversenseCloudUploadEnabled` |
+| Calibration bounded to 40–400 mg/dL | `plugins/source/activities/EversenseCalibrationActivity.kt` | **We were worse than CAPTCG here.** Ours checked only `bgValue <= 0` — no `maxLength` in the layout, no guard in `sendCalibration`, the communicator or the packet (16-bit mask only). A user could send 12 or 1200 mg/dL, which becomes the transmitter's reference and shifts **every later reading**. Enforced after conversion, so it holds in mmol/L too (2.2–22.2) |
+| mmol conversion uses the project constant | same file | Replaced a hardcoded `18.0182` and an `asText == "mmol"` string compare with `profileUtil.convertToMgdl`, which uses `Constants.MMOLL_TO_MGDL = 18.01559`. **`roundToInt`, not `toInt`** — truncating turns 2.2 mmol/L into 39 mg/dL and rejects the advertised low bound |
+| Quick-launch buttons no longer silently deleted | `ui/compose/quickLaunch/QuickLaunchResolver.kt` | Upstream `37ee19314b`. `isValid()` conflated "valid" with "usable right now"; `MainViewModel.refreshQuickLaunch` reads "not valid" as "delete from the saved toolbar". A `StaticAction` wraps a fixed `ElementType` and can never go stale, so it is now always valid |
+| Unusable buttons grey out instead of vanishing | same file | **Fork divergence: CAPTCG deletes the `elementAvailability` parameter, we keep it** and feed `resolveItem`'s `enabled` from it. `QuickLaunchConfigScreen` ignores that flag, so the picker stays usable. **Behaviour change beyond the port:** buttons whose plugin is currently inactive now render greyed on the toolbar, where before every button rendered enabled |
+| Quick-launch "Eversense Calibration" button | `ElementType`, `ElementTypeStyle`, `ElementAvailability`, `QuickLaunchAction`, `AppRoute`, `AppNavGraph`, `ComposeMainActivity`, new `core/interfaces/source/EversenseCalibrationSource.kt`, new `ui/compose/eversenseCalibrationDialog/` | Upstream `a80dd7ed5c`, **reimplemented banner-free**. Wired through our own `QuickLaunchAction.Afrezza` chain. Three deliberate improvements over CAPTCG: the 40–400 bound, a `CalibrationReadiness.READY` gate (their dialog bypasses the readiness UI this doc lists as a fork advantage), and a confirm step |
+
+**Ordering constraint, do not reverse it:** the quick-launch delete fix MUST land before the new
+button. `EVERSENSE_CALIBRATION` availability follows `EversensePlugin.isEnabled()`, and for an
+Eversense user the older `CALIBRATION` availability is always false because our plugin is a `BgSource`,
+not a calibration plugin. Added before the fix, the new button would have been the third silently
+deleted case.
+
+**Not applicable:** `e611a6ad41` (their README) and `b68d37cd46` (a doc comment on the calibration
+countdown banner, which we deliberately did not port — our dashboard skin bypasses the screen it
+lives on).
+
+**Correction to the 2026-09-01 entry:** the two-timestamp E3 calibration command, listed there among
+the deferred items, is in fact already ours (`SendCalibrationPacket.kt`, command `0x3C`, byte
+`[14] = 0x55`). `EversenseE3Memory.kt` remains untouched and its register addresses remain deferred.
+
+**Also noted, not fixed:** `EversensePlugin.kt` around the toast call site uses two fully-qualified
+inline names (`app.aaps.plugins.eversense.util.EversenseHttp365Util` and `android.widget.Toast`),
+against the project's explicit-import rule. Pre-existing; left alone to keep this diff reviewable.
+
+**Verified:** `:app:assembleFullDebug` green; `:plugins:eversense` and `:core:keys` unit tests green.
+**Not verified:** the 10 new `:ui` test cases COMPILE but were never RUN — the `:ui` test source set
+is blocked by pre-existing breakage (`GraphViewModelTest`, `RunningModeManagementViewModelTest`).
+All runtime behaviour needs hardware: a real calibration reaching an E3 or 365, the toast suppression,
+and the quick-launch grey-out. The 40–400 range itself is CAPTCG's assertion, not a Senseonics
+document — inference, in the conservative direction.
+
+### CAPTCG sync 2026-09-06 (swapping to a replacement transmitter)
+
+Reference: [CAPTCG/AndroidAPS-Eversense-](https://github.com/CAPTCG/AndroidAPS-Eversense-) branch
+`european-region-support` @ **bfffcc6e8b** (3 commits past `88e60751da`). `master` has not moved since
+2026-08-27 and is still `fc1ae8c8f2` — **watch the feature branch, not master**.
+
+All three commits address one scenario, replacing a transmitter, and all three are backed by field
+logs in their commit bodies.
+
+| Change | File | Notes |
+|--------|------|--------|
+| `autoConnect = false` on the fresh-scan branch | `EversenseCGMPlugin.connect()` | Upstream `5572cdbfdd`. **We had this bug.** Both branches passed `true`. On a device just found by an active scan and never bonded, `autoConnect = true` yields no GATT callback and no pairing prompt, silently and forever — so a **new transmitter never connected**. The stored-device branch keeps `true`: our persistent 60 s retry loop and `reconnectRunnable` both go through `connect(null)` and depend on it |
+| `disallowUseShortcut()` on an explicit device | `EversenseCGMPlugin.connect()` | Upstream `bfffcc6e8b`. `canUseShortcut()` is a plain saved flag, not tied to any transmitter identity, so a cached shortcut is always wrong for newly picked hardware. Without this the 365 tries it, is rejected, and only recovers after `SHORTCUT_FAIL_THRESHOLD` (3) failures — about **two wasted connect/auth/disconnect cycles with no glucose**. E3 is unaffected, its auth flow has no shortcut |
+| "Change transmitter" button | `EversenseStatusActivity`, `activity_eversense_status.xml`, `plugins/source` strings | Upstream `b28ece701d`, hand ported — our activity is an `EversenseWatcher` rewrite and our layout has diverged. **Order deliberately inverted vs CAPTCG:** we clear the stored address *before* disconnecting, so `scheduleReconnect()` cannot queue a reconnect to the old MAC that would race the new transmitter |
+| Honest disconnect wording | `plugins/source` strings | Fork addition. The confirm text now says the app also forgets the transmitter — see the design note below |
+
+**Design decision — `clearStoredDevice()` stays on the Disconnect path.** We considered removing it so
+that a deliberate disconnect would only disconnect, matching CAPTCG. **That would have been wrong:**
+that call is the only thing that makes Disconnect stick. `scheduleReconnect()`, both runnables,
+`onStart()` and `forceReconnect()` are all keyed on the stored address and there is no
+"stay disconnected" flag, so removing it would have turned Disconnect into a five-second pause.
+Kept as is, and the confirmation text now states the consequence instead of hiding it.
+
+**Known cost of that choice, combined with the shortcut change:** because Disconnect forgets the
+device, the next connect goes through the scan-and-pick path, which now forces a full
+internet-dependent handshake even when reconnecting to the *same* transmitter. Self-healing through
+`FULL_AUTH_FAIL_THRESHOLD`, but it is a real behaviour change and users will notice it.
+
+**Verified:** `:plugins:eversense` and `:plugins:source` compile clean; `:plugins:eversense`
+unit tests 76 passed / 0 failed, including a new `SECURE_STATE` round-trip lock proving
+`disallowUseShortcut()` does not wipe the key pair, the credentials or `isEuropeanRegion`.
+**Not verified — needs hardware.** `connectGatt` cannot be unit tested here. Still open: that an
+already-paired reconnect still logs `Reconnecting to stored device`; Bluetooth radio-toggle recovery;
+that the 365 shortcut is still used on a normal status-19 reconnect; the offline
+`FULL_AUTH_FAIL_THRESHOLD` self-heal; and that no `Scheduling auto-reconnect` appears after
+"Change transmitter".
+
+**Left alone, pre-existing:** the disconnect dialog's button labels are still hardcoded English
+literals (`"Disconnect"`, `"Cancel"`) in this activity. Out of scope here; worth a dedicated pass.

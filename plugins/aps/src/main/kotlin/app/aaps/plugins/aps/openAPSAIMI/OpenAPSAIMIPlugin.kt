@@ -4,9 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.os.Looper
-import android.util.LongSparseArray
 import androidx.annotation.ArrayRes
-import androidx.core.util.forEach
 import app.aaps.plugins.aps.openAPSAIMI.steps.UnifiedActivityProviderMTR
 import app.aaps.core.data.aps.SMBDefaults
 import app.aaps.core.data.model.GlucoseUnit
@@ -86,6 +84,8 @@ import app.aaps.plugins.aps.R
 import app.aaps.plugins.aps.events.EventOpenAPSUpdateGui
 import app.aaps.plugins.aps.events.EventResetOpenAPSGui
 import app.aaps.plugins.aps.openAPS.TddStatus
+import app.aaps.plugins.aps.openAPSAIMI.ISF.CommandedIsf
+import app.aaps.plugins.aps.openAPSAIMI.ISF.DynIsfCache
 import app.aaps.plugins.aps.openAPSAIMI.ISF.DynIsfTrajectoryTuning
 import app.aaps.plugins.aps.openAPSAIMI.ISF.DynamicSensitivityPolicy
 import app.aaps.plugins.aps.openAPSAIMI.ISF.IsfAdjustmentEngine
@@ -105,6 +105,7 @@ import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.floor
 import kotlin.math.max
 import app.aaps.plugins.aps.openAPSAIMI.ISF.IsfBlender
@@ -115,6 +116,7 @@ import app.aaps.plugins.aps.openAPSAIMI.pkpd.InsulinActivityStage
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.InsulinKineticsAuthority
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkpdLearningDiagnostics
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdIntegration
+import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdLearnedState
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdCsvLogger
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdRuntime
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkpdSmbTailDamping
@@ -161,6 +163,7 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
     private val iobCobCalculator: IobCobCalculator,
     private val hardLimits: HardLimits,
     private val preferences: Preferences,
+    private val pkPdLearnedState: PkPdLearnedState,
     private val sp: SP,
     protected val dateUtil: DateUtil,
     private val processedTbrEbData: ProcessedTbrEbData,
@@ -307,15 +310,15 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
                 var count = 0
                 val apsResults =
                     persistenceLayer.getApsResults(dateUtil.now() - T.days(1).msecs(), dateUtil.now())
-                synchronized(dynIsfCacheLock) {
-                    apsResults.forEach {
-                        val glucose = it.glucoseStatus?.glucose ?: return@forEach
-                        val variableSens = it.variableSens ?: return@forEach
-                        val timestamp = it.date
-                        val key = timestamp - timestamp % T.mins(30).msecs() + glucose.toLong()
-                        if (variableSens > 0) dynIsfCache.put(key, variableSens)
-                        count++
-                    }
+                apsResults.forEach {
+                    val glucose = it.glucoseStatus?.glucose ?: return@forEach
+                    val variableSens = it.variableSens ?: return@forEach
+                    // These history rows carry the late DetermineBasal value, so they already hold
+                    // the physiological factor. They are loaded so `getAverageIsfMgdl` has a 24-hour
+                    // window right after a restart; the first refresh of the tick writes a freshly
+                    // computed value on top of them, and that is what `newest()` then serves.
+                    dynIsfCache.put(atMs = it.date, isfMgdl = variableSens, glucoseMgdl = glucose)
+                    count++
                 }
                 aapsLogger.debug(LTag.APS, "Loaded $count variable sensitivity values from database")
             } catch (e: Exception) {
@@ -385,7 +388,7 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
     override var lastAPSResult: APSResult? = null
     override fun usingDynamicIsf(): Boolean = preferences.get(BooleanKey.ApsUseDynamicSensitivity)
     override fun offersDynamicSensitivity(): Boolean = true
-    private val pkpdIntegration = PkPdIntegration(preferences)
+    private val pkpdIntegration = PkPdIntegration(preferences, pkPdLearnedState)
     private var lastPkpdScale: Double = 1.0
     // Dans votre classe principale (ou plugin), vous pouvez d?clarer :
     private val kalmanISFCalculator = KalmanISFCalculator(tddCalculator, preferences, aapsLogger)
@@ -554,34 +557,32 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
     /**
      * Reads the newest cache entry and records **which source was used** in [IsfSourceTelemetry].
      *
-     * Diagnostic only — it does not change which value is returned. The cache key is
-     * `bucketStart + glucose` (see the warm-up loop), so `valueAt(size - 1)` returns the entry of
-     * the highest glucose in the newest 30-minute bucket, not the most recent one. The bucket start
-     * is recovered from the key to report the age of the value actually used.
+     * Diagnostic only — it does not change which value is returned. [DynIsfCache] is keyed on time
+     * alone, so `newest()` is really the most recent sample, and the sample carries its own write
+     * time, so the age reported here is exact.
      *
-     * See `docs/adr/0003-dynisf-cache-read-path.md`.
+     * A stale value is still returned. It is reported as stale, never turned into `null`: a `null`
+     * makes the caller fall back to the static profile ISF, which is usually lower and would command
+     * **more** insulin. See `docs/adr/0003-dynisf-cache-read-path.md`.
      */
     private fun readNewestDynIsfAndRecordSource(now: Long): Double? {
-        val entry = synchronized(dynIsfCacheLock) {
-            val size = dynIsfCache.size()
-            if (size == 0) null else dynIsfCache.keyAt(size - 1) to dynIsfCache.valueAt(size - 1)
-        }
-        if (entry == null) {
+        val sample = dynIsfCache.newest()
+        if (sample == null) {
             IsfSourceTelemetry.record(IsfSourceTelemetry.SOURCE_PROFILE_FALLBACK, null, null)
             return null
         }
-        val (key, value) = entry
-        val bucketMs = T.mins(30).msecs()
-        val bucketStart = key - key % bucketMs
-        // The key is `bucketStart + glucose`, so the remainder identifies the reading this value was
-        // computed for. Two entries of the same bucket share an age but not a key.
-        val cacheGlucose = key % bucketMs
-        val ageMs = (now - bucketStart).coerceAtLeast(0L)
+        val ageMs = (now - sample.atMs).coerceAtLeast(0L)
         val source =
             if (ageMs > IsfSourceTelemetry.STALE_AFTER_MS) IsfSourceTelemetry.SOURCE_DYNAMIC_STALE
             else IsfSourceTelemetry.SOURCE_DYNAMIC_FRESH
-        IsfSourceTelemetry.record(source, value, ageMs, cacheKey = key, cacheGlucoseMgdl = cacheGlucose)
-        return value
+        IsfSourceTelemetry.record(
+            source,
+            sample.isfMgdl,
+            ageMs,
+            cacheKey = sample.atMs,
+            cacheGlucoseMgdl = sample.glucoseMgdl?.toLong(),
+        )
+        return sample.isfMgdl
     }
 
     override fun getIsfMgdl(profile: Profile, caller: String): Double? {
@@ -595,12 +596,16 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
         if (Looper.myLooper() == Looper.getMainLooper()) {
             // Keep UI path non-blocking; use latest cache and refresh in background.
             val cached = readNewestDynIsfAndRecordSource(start)
-            aimiPluginIoScope.launch { runCatching { calculateVariableIsf(start) } }
+            if (dynIsfRefreshDue(start)) {
+                aimiPluginIoScope.launch { runCatching { calculateVariableIsf(start, useDbShortcut = false) } }
+            }
             return cached?.let { it * multiplier }
         }
 
         val cached = readNewestDynIsfAndRecordSource(start)
-        aimiPluginIoScope.launch { runCatching { calculateVariableIsf(start) } }
+        if (dynIsfRefreshDue(start)) {
+            aimiPluginIoScope.launch { runCatching { calculateVariableIsf(start, useDbShortcut = false) } }
+        }
         profiler.log(
             LTag.APS,
             "getIsfMgdl() CACHE $cached src=${IsfSourceTelemetry.lastSource} " +
@@ -611,27 +616,12 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
     }
 
     override fun getAverageIsfMgdl(timestamp: Long, caller: String): Double? {
-        val (count, sum) = synchronized(dynIsfCacheLock) {
-            if (dynIsfCache.isEmpty()) {
-                return@synchronized -1 to 0.0
-            }
-            var c = 0
-            var s = 0.0
-            val start = timestamp - T.hours(24).msecs()
-            dynIsfCache.forEach { key, value ->
-                if (key in start..timestamp) {
-                    c++
-                    s += value
-                }
-            }
-            c to s
-        }
-        if (count < 0) {
+        if (dynIsfCache.isEmpty()) {
             maybeLogDynIsfCacheEmptyWarning(caller)
             return null
         }
-        val sensitivity = if (count == 0) null else sum / count
-        aapsLogger.debug(LTag.APS, "getAverageIsfMgdl() $sensitivity from $count values ${dateUtil.dateAndTimeAndSecondsString(timestamp)} $caller")
+        val sensitivity = dynIsfCache.averageSince(timestamp - T.hours(24).msecs(), timestamp)
+        aapsLogger.debug(LTag.APS, "getAverageIsfMgdl() $sensitivity over 24 h ${dateUtil.dateAndTimeAndSecondsString(timestamp)} $caller")
         return sensitivity
     }
 
@@ -666,8 +656,29 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
         return pump.pumpDescription.isTempBasalCapable
     }
 
-    private val dynIsfCache = LongSparseArray<Double>()
-    private val dynIsfCacheLock = Any()
+    private val dynIsfCache = DynIsfCache()
+
+    /** Time of the last background refresh that was started, used by [dynIsfRefreshDue]. */
+    private val dynIsfRefreshGate = AtomicLong(0L)
+
+    /**
+     * True at most once per [DYN_ISF_REFRESH_MIN_INTERVAL_MS], for the caller that wins the race.
+     *
+     * `getIsfMgdl` is called many times per tick, and every call used to start a full recomputation
+     * on the background scope. Now that the refresh no longer takes the database short cut it is a
+     * real computation, so it is started once per minute at most.
+     */
+    private fun dynIsfRefreshDue(nowMs: Long): Boolean {
+        val last = dynIsfRefreshGate.get()
+        if (nowMs - last < DYN_ISF_REFRESH_MIN_INTERVAL_MS) return false
+        return dynIsfRefreshGate.compareAndSet(last, nowMs)
+    }
+
+    companion object {
+
+        /** Shortest gap between two background dynamic ISF refreshes. */
+        private const val DYN_ISF_REFRESH_MIN_INTERVAL_MS = 60_000L
+    }
 
     // Exemple de fonction pour pr?dire le delta futur ? partir d'un historique r?cent
     private fun predictedDelta(deltaHistory: List<Double>): Double {
@@ -776,19 +787,49 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
         return recent
     }
     @SuppressLint("DefaultLocale")
+    /**
+     * Estimates the dynamic sensitivity and, on the `CALC` path only, stores it in [dynIsfCache].
+     *
+     * @param useDbShortcut when true, a sensitivity already written to the database for a nearby
+     *   time is reused instead of running the chain again. The loop wants that: it would otherwise
+     *   pay for the whole chain twice on the same tick. The background refresh must not take it.
+     *
+     *   Taking the short cut is exactly what starved the cache: `getApsResultCloseTo` matches within
+     *   5 minutes and the loop really runs about once a minute, so the `DB` path was taken on nearly
+     *   every cycle, the `CALC` path almost never ran, and nothing was ever written. Measured over
+     *   1412 cycles: 93.9 % of them served a stale value, up to 241.9 minutes old.
+     *
+     *   The database row cannot stand in for a recomputation either. It carries the late
+     *   DetermineBasal value, which already holds the physiological factor, while this function
+     *   returns the estimate **without** it. Storing one in place of the other would apply that
+     *   factor twice. See `docs/adr/0002-sensitivity-three-levels.md` and
+     *   `docs/adr/0003-dynisf-cache-read-path.md`.
+     */
     private suspend fun calculateVariableIsf(
         timestamp: Long,
         pkpdScaleForTick: Double = lastPkpdScale,
         fusedSlowIsfOverride: Double? = null,
+        useDbShortcut: Boolean = true,
     ): Pair<String, Double?> {
-        if (!preferences.get(BooleanKey.ApsUseDynamicSensitivity)) return "OFF" to null
+        if (!preferences.get(BooleanKey.ApsUseDynamicSensitivity)) {
+            IsfSourceTelemetry.recordCalcPath("OFF", dynIsfCache.size())
+            return "OFF" to null
+        }
 
         // 0) cache DB existant
-        val result = persistenceLayer.getApsResultCloseTo(timestamp)
-        if (result?.variableSens != null) return "DB" to result.variableSens
+        if (useDbShortcut) {
+            val result = persistenceLayer.getApsResultCloseTo(timestamp)
+            if (result?.variableSens != null) {
+                IsfSourceTelemetry.recordCalcPath("DB", dynIsfCache.size())
+                return "DB" to result.variableSens
+            }
+        }
 
         // 1) BG & deltas actuels
-        val glucose = glucoseStatusProvider.glucoseStatusData?.glucose ?: return "GLUC" to null
+        val glucose = glucoseStatusProvider.glucoseStatusData?.glucose ?: run {
+            IsfSourceTelemetry.recordCalcPath("GLUC", dynIsfCache.size())
+            return "GLUC" to null
+        }
         val currentDelta = glucoseStatusProvider.glucoseStatusData?.delta
         val recentDeltas = getRecentDeltas()
         val predictedDelta = predictedDelta(recentDeltas)
@@ -796,15 +837,30 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
         // 2) facteur historique (comme avant)
         val dynamicFactor = dynamicDeltaCorrectionFactor(currentDelta, predictedDelta, glucose)
 
+        // The static profile ISF is read here, before the Kalman call, so it can bound the fast
+        // estimator from below. `getProfileIsfMgdl()` only reads the profile ISF blocks: it is pure,
+        // and it does not call back into `getIsfMgdl`, so there is no re-entrancy.
+        val profileIsf = profileFunction.getProfile()?.getProfileIsfMgdl() ?: 20.0
+
         // 3) ISF rapide #1 : Kalman existant
-        val kalmanFastIsf = kalmanISFCalculator.calculateISF(glucose, currentDelta, predictedDelta)
+        val kalmanFastIsf = kalmanISFCalculator.calculateISF(glucose, currentDelta, predictedDelta, profileIsf)
         aapsLogger.debug(LTag.APS, "Adaptive ISF via Kalman: $kalmanFastIsf for BG: $glucose")
 
         // 4) ISF lent (socle) : profil/TDD fusionn? + pkpdScale (inchang?)
-        val profileIsf = profileFunction.getProfile()?.getProfileIsfMgdl() ?: 20.0
         val tddIsf = tddIsf24hOr(profileIsf)
         val fusedSlowIsf = fusedSlowIsfOverride?.takeIf { it.isFinite() && it > 0.0 }
-            ?: isfFusion().fused(profileIsf, tddIsf, pkpdScaleForTick)
+            // isfFusion() builds a throwaway instance, so its slew limiter is inert anyway:
+            // there is no anchor to carry over between ticks. Downstream smoothing is done by
+            // isfBlender.
+            ?: isfFusion().fused(
+                profileIsf = profileIsf,
+                tddIsf = tddIsf,
+                pkpdScale = pkpdScaleForTick,
+                nowMs = timestamp,
+                // The slew anchor stays with the loop. The background refresh runs off the tick, so
+                // it must not move the anchor the loop measures its next step against.
+                authoritative = useDbShortcut
+            )
         aapsLogger.debug(LTag.APS, "Fused slow ISF: $fusedSlowIsf (profile=$profileIsf, tddIsf=$tddIsf, pkpdScale=$pkpdScaleForTick)")
 
         // 5) EMA TDD (stabilise l?ajustement AF)
@@ -814,7 +870,17 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
             else -> prev + TDD_EMA_ALPHA * (tdd24 - prev)
         }
 
-        // 6) proxys de confiance (si variance non expos?e ici)
+        // 6) Confidence proxies, derived from the delta.
+        //
+        // KalmanFilter.estimationError is public and would be the obvious confidence signal, but it
+        // is read nowhere and wiring it here would not help. The filter has no process model: with
+        // processVariance = 10 and measurementVariance in [0.5, 2.0], the Kalman gain settles
+        // between 0.85 and 0.95 on every update, and on 0.877 for the 1.6 used at glucose >= 110
+        // with a quiet delta. So estimationError converges to a fixed point (about 1.4 in that
+        // case) within two ticks and stays there whatever the measurements do. It describes the
+        // filter's own tuning constants, not how good the estimate is. A usable variance would need
+        // a process model for the sensitivity, which does not exist. The delta-derived proxy below
+        // is a heuristic and is named as one.
         val kalmanTrustProxy = estimateKalmanTrustFromDelta(currentDelta)             // 0..1
         val kalmanVarProxy = (1.0 - kalmanTrustProxy).coerceIn(0.0, 1.0)             // 1-trust
         val sippConfidence = AimiUamHandler.confidenceOrZero().coerceIn(0.0, 1.0)
@@ -911,11 +977,8 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
         )
 
         // 11) cache
-        val key = timestamp - timestamp % T.mins(30).msecs() + glucose.toLong()
-        synchronized(dynIsfCacheLock) {
-            if (dynIsfCache.size > 1000) dynIsfCache.clear()
-            dynIsfCache.put(key, blended)
-        }
+        dynIsfCache.put(atMs = timestamp, isfMgdl = blended, glucoseMgdl = glucose)
+        IsfSourceTelemetry.recordCalcPath("CALC", dynIsfCache.size())
 
         return "CALC" to blended
     }
@@ -1080,7 +1143,13 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
                 tdd24h = tdd24Hrs,
                 combinedDelta = currentDelta ?: 0.0,
                 uamConfidence = AimiUamHandler.confidenceOrZero(),
-                allowLearning = !preferences.get(BooleanKey.OApsAIMIIntelligenceSingleLearnPath),
+                // Read-only by design: signal-prep is the only learning path per tick. This call
+                // passes a fixed window and no bolus samples, so letting it learn would pollute the
+                // shared learned state.
+                allowLearning = false,
+                // Distinct PkPdIntegration instance: this is its ONLY fused() call per tick, so it must
+                // own the slew anchor or the limiter stays inert.
+                isfRateLimitAuthority = true,
             )
             lastPkpdScale = pkpdRuntimeForActivity?.pkpdScale ?: 1.0
 
@@ -1392,25 +1461,19 @@ open class OpenAPSAIMIPlugin  @Inject constructor(
                 // before the multipliers that undo it, which is the defect ADR 0008 keeps recording: the
                 // physiological factor is applied after the `coerceIn(5.0, 300.0)` on this path, which is
                 // how a commanded sensitivity of 4.54 mg/dL/U was reached on 2026-08-14 (5.00 x 0.908).
-                sens = DynamicSensitivityPolicy.floorAgainstProfile(
-                    commandedMgdlPerU = profile.getIsfMgdl("OpenAPSAIMIPlugin") * physioMults.isfFactor,
+                // The shadow witness of that same bound used to be recorded here, on the value the
+                // floor had **already** raised. Its own lower bound is the same 0.5 x profile, so it
+                // could never fire again: `isf_profile_relative_bound_hit` was false on 709 night
+                // ticks out of 709 while the floor was really setting the value on 244 of them. The
+                // order now lives in [CommandedIsf], which measures first and floors after.
+                // See `docs/adr/0008-isf-decision-architecture.md`.
+                sens = CommandedIsf.floorAgainstProfileAndRecordShadow(
+                    // The commanded sensitivity after every multiplier and before the floor. Read
+                    // here, at the same place the old code read it, so the number the loop commands
+                    // is unchanged.
+                    preFloorMgdlPerU = profile.getIsfMgdl("OpenAPSAIMIPlugin") * physioMults.isfFactor,
                     profileIsfMgdlPerU = runCatching { profile.getProfileIsfMgdl() }.getOrNull(),
-                ).also { commanded ->
-                    // Shadow only — nothing reads this. Records what an **unconditional exit clamp**
-                    // relative to the profile would command.
-                    //
-                    // It was first placed inside `calculateVariableIsf`, before the effective-profile
-                    // percentage and the physiological factor. Production then showed the commanded
-                    // sensitivity reaching x0.46 and x2.11 of profile while the shadow reported a
-                    // single hit in 282 ticks — the guard had been put before the multipliers that
-                    // undo it, which is precisely the defect this ADR set keeps documenting. It now
-                    // sits where the value is final.
-                    // See `docs/adr/0008-isf-decision-architecture.md`.
-                    IsfSourceTelemetry.recordProfileRelativeShadow(
-                        blendedMgdl = commanded,
-                        profileIsfMgdl = runCatching { profile.getProfileIsfMgdl() }.getOrNull() ?: 0.0,
-                    )
-                },
+                ),
                 autosens_adjust_targets = false, // not used
                 max_daily_safety_multiplier = preferences.get(DoubleKey.ApsMaxDailyMultiplier) * physioMults.smbFactor, // ?? SMB Cap modulation
                 current_basal_safety_multiplier = preferences.get(DoubleKey.ApsMaxCurrentBasalMultiplier) * physioMults.basalFactor, // ?? Basal Cap modulation

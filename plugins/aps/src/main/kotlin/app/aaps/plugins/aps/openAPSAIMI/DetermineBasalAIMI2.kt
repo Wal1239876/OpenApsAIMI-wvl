@@ -51,7 +51,12 @@ import app.aaps.plugins.aps.openAPSAIMI.basal.T3cAutodriveBasalBridge
 import app.aaps.plugins.aps.openAPSAIMI.basal.T3cTrajectoryContext
 import app.aaps.plugins.aps.openAPSAIMI.autodrive.models.AutoDriveState
 import app.aaps.plugins.aps.openAPSAIMI.carbs.CarbsAdvisor
+import app.aaps.plugins.aps.openAPSAIMI.ISF.CommandedIsf
+import app.aaps.plugins.aps.openAPSAIMI.ISF.ObservedSensitivityMeter
 import app.aaps.plugins.aps.openAPSAIMI.ISF.SensitivityRatioEstimator
+import app.aaps.plugins.aps.openAPSAIMI.patient.HarmoniaCounterfactual
+import app.aaps.plugins.aps.openAPSAIMI.patient.HarmoniaSafetyVerdict
+import app.aaps.plugins.aps.openAPSAIMI.quality.InsulinOriginMeter
 import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.plugins.aps.openAPSAIMI.context.ContextSnapshot
 import app.aaps.plugins.aps.openAPSAIMI.utils.AimiStorageHelper
@@ -60,6 +65,7 @@ import app.aaps.core.data.model.HR
 import app.aaps.plugins.aps.openAPSAIMI.model.DecisionResult
 import app.aaps.plugins.aps.openAPSAIMI.ml.AimiSmbTrainer
 import app.aaps.plugins.aps.openAPSAIMI.ml.SmbRefinementFeatureSchema
+import app.aaps.plugins.aps.openAPSAIMI.ml.SmbTrainingRowBuffer
 import app.aaps.plugins.aps.openAPSAIMI.advisor.auditor.AuditorJsonlExport
 import app.aaps.plugins.aps.openAPSAIMI.advisor.auditor.AuditorVerdict
 import app.aaps.plugins.aps.openAPSAIMI.smb.SmbIntervalPolicy
@@ -69,6 +75,7 @@ import app.aaps.plugins.aps.openAPSAIMI.model.PumpCaps
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdCsvLogger
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.MealAggressionContext
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdIntegration
+import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdLearnedState
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkpdBolusSample
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdLogRow
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.IsfTddProvider
@@ -190,6 +197,7 @@ import app.aaps.plugins.aps.openAPSAIMI.safety.CompressionReboundGuard
 import app.aaps.plugins.aps.openAPSAIMI.safety.HypoTools
 import app.aaps.plugins.aps.openAPSAIMI.safety.InsulinStackingStance
 import app.aaps.plugins.aps.openAPSAIMI.safety.SafetyDecision
+import app.aaps.plugins.aps.openAPSAIMI.smb.MaxSmbLadder
 import app.aaps.plugins.aps.openAPSAIMI.smb.SmbDampingUsecase
 import app.aaps.plugins.aps.openAPSAIMI.smb.SmbInstructionExecutor
 import app.aaps.plugins.aps.openAPSAIMI.smb.computeMealHighIobDecision
@@ -325,10 +333,114 @@ internal data class AimiDecisionContext(
         val isf_source: String? = null,
         /** Age (ms) of the cached dynamic entry that was used, when one was used. */
         val isf_age_ms: Long? = null,
-        /** Key of the cached entry used. Distinguishes two entries sharing a 30-minute bucket. */
+        /** Exact time the cached entry that was used had been written. */
         val isf_cache_key: Long? = null,
-        /** Glucose the cached value was computed for (the key's within-bucket remainder). */
+        /** Glucose the cached value was computed for. */
         val isf_cache_glucose_mgdl: Long? = null,
+        /** Exit path of the last sensitivity pass: `OFF`, `DB`, `GLUC` or `CALC`. */
+        val isf_calc_path: String? = null,
+        /** How many samples the dynamic ISF store held at the end of that pass. */
+        val isf_cache_size: Int? = null,
+        /**
+         * Sensitivity the **outcomes** imply, in mg/dL per U, measured as `-dBG / insulin absorbed`
+         * over clean falls. See `ObservedSensitivityMeter`.
+         *
+         * A fall is counted only when it lasts 30 to 120 minutes, drops at least 25 mg/dL, has no
+         * carbs on board and no meal in the 30 minutes before it, shows a mean rate of glucose
+         * appearance below 0.30 mg/dL/min, and cost at least 0.8 U. The insulin credited is the fall
+         * in IOB, plus the basal above the profile rate, plus the SMBs decided inside the window.
+         *
+         * The median is `null` below three windows, never `0.0`: zero would read as a real
+         * sensitivity of zero. [isf_obs_window_count] says how far the instrument is from being able
+         * to answer.
+         *
+         * These fields are **strictly passive**. Nothing in the dosing chain reads them. They exist
+         * for one purpose: to be compared with [command_isf_mgdl], so that the question "does the ISF
+         * chain estimate the right quantity" can finally be answered from exported data.
+         *
+         * `var`, and written after this object is built, like the fields below.
+         */
+        var isf_obs_median_mgdl: Double? = null,
+        /** Same measure, night windows only (local hour 0 to 8). */
+        var isf_obs_night_median_mgdl: Double? = null,
+        /** Same measure, day windows only. */
+        var isf_obs_day_median_mgdl: Double? = null,
+        /** How many windows the look-back holds. Reported even when the median is `null`. */
+        var isf_obs_window_count: Int? = null,
+        /** How many of them are night windows. */
+        var isf_obs_night_count: Int? = null,
+        /** How many of them are day windows. */
+        var isf_obs_day_count: Int? = null,
+        /** End time of the most recent window, so a reading can be aged. */
+        var isf_obs_last_window_end_ms: Long? = null,
+        /** Sensitivity of that most recent window alone. */
+        var isf_obs_last_window_mgdl: Double? = null,
+        /** Fall of that window, mg/dL. */
+        var isf_obs_last_window_drop_mgdl: Double? = null,
+        /** Insulin credited to that window, U. */
+        var isf_obs_last_window_absorbed_u: Double? = null,
+        /**
+         * Shadow late fat damping window: the late part of an absorption episode while a large
+         * insulin stack is already working. Strictly passive — nothing in the dosing chain reads it.
+         * It exists to be compared with [late_fat_rise_flag] before any wiring is decided.
+         */
+        var late_fat_damping_window: Boolean? = null,
+        /** The old `isLateFatProteinRise` predicate for the same tick, to measure the divergence. */
+        var late_fat_rise_flag: Boolean? = null,
+        /** Minutes since the absorption episode started, `null` when there is no episode. */
+        var late_fat_onset_age_min: Int? = null,
+        /**
+         * Harmonia counterfactual, strictly passive. Nothing in the dosing chain reads these fifteen
+         * fields, and nothing may ever read them: they exist only so that what Harmonia proposed can
+         * be compared, after the fact, with what was really done.
+         *
+         * Harmonia is asked for a plan before the tick knows whether the SMB channel was zeroed for
+         * safety. It is then judged on exactly that verdict, and never told it, nor told that it was
+         * refused. These fields write down the missing message and its price:
+         *
+         *  - `harmonia_cf_*` — what Harmonia would propose if it were told, and whether that differs
+         *    from what it really proposed. [harmonia_cf_changes_proposal] is the whole question.
+         *  - `harmonia_block_*` — the size of the refusal. [harmonia_block_stake_u] is signed:
+         *    negative means the refusal **added** insulin, because it refused an under-dose.
+         *  - `harmonia_verdict_*` — the mirrored safety verdict.
+         *    [harmonia_verdict_known_to_engine] is the witness of inertia: it is written `false`, and
+         *    stays `false` for as long as nothing feeds the verdict back into the decision.
+         *  - `harmonia_prev_*` — what refused the previous tick, and for how many ticks in a row.
+         *  - [harmonia_tree_risk_divergence] — set only when the tree trunk and Harmonia disagree on
+         *    the risk level.
+         *
+         * `var`, and written after this object is built, like the fields above. See
+         * `HarmoniaCounterfactual`.
+         */
+        var harmonia_cf_rule: String? = null,
+        /** Action Harmonia would propose knowing the verdict. */
+        var harmonia_cf_action: String? = null,
+        /** Basal that goes with that action, U/h. */
+        var harmonia_cf_basal_uph: Double? = null,
+        /** `true` only when knowing the verdict would change the proposal. */
+        var harmonia_cf_changes_proposal: Boolean? = null,
+        /** The refused request was above the profile basal by more than one pump step. */
+        var harmonia_block_was_escalation: Boolean? = null,
+        /** Request minus profile basal, U/h, signed. */
+        var harmonia_block_delta_uph: Double? = null,
+        /** Insulin the refusal moved over the applied duration, U, signed. */
+        var harmonia_block_stake_u: Double? = null,
+        /** Applied rate minus requested rate, U/h. */
+        var harmonia_applied_gap_uph: Double? = null,
+        /** Mirrored verdict: a safety rule zeroed the SMB of this tick. */
+        var harmonia_verdict_critical_safety: Boolean? = null,
+        /** Mirrored verdict: the active context suppresses the SMB of this tick. */
+        var harmonia_verdict_context_suppress: Boolean? = null,
+        /** Mirrored verdict: a manual meal mode is declared, which exempts the channel. */
+        var harmonia_verdict_meal_mode: Boolean? = null,
+        /** Witness of inertia. Written `false`: the engine is never told the verdict. */
+        var harmonia_verdict_known_to_engine: Boolean? = null,
+        /** Runtime blocker of the previous tick, `null` when there was none. */
+        var harmonia_prev_blocker: String? = null,
+        /** How many ticks in a row the same blocker has refused Harmonia. */
+        var harmonia_prev_blocked_streak: Int? = null,
+        /** `"tronc=X|harmonia=Y"` when the two risk views differ, `null` when they agree. */
+        var harmonia_tree_risk_divergence: String? = null,
         /** Fast estimator 1: Kalman-filtered raw ISF. */
         val isf_kalman_fast_mgdl: Double? = null,
         /** Fast estimator 2: IsfAdjustmentEngine output. */
@@ -345,6 +457,13 @@ internal data class AimiDecisionContext(
         val estimated_ra_mgdl_per_min: Double? = null,
         /** Physiological ISF factor of the tick, bounds [0.85, 1.15]. Applied once since ADR 0007. */
         val physio_isf_factor: Double? = null,
+        /**
+         * Commanded sensitivity before the profile-relative floor, mg/dL per U.
+         *
+         * Next to `command_isf_mgdl` it says how much the floor moved this tick, which no exported
+         * field could say while the shadow witness was reading the already-floored value.
+         */
+        val isf_pre_floor_mgdl: Double? = null,
         /** Shadow: sensitivity an unconditional exit clamp relative to the profile would command. */
         val isf_profile_relative_shadow_mgdl: Double? = null,
         /** Shadow: true when that clamp would have changed the value. */
@@ -533,6 +652,11 @@ internal data class AimiDecisionContext(
          * it, and the SMB before / after its cap. See `docs/adr/0006-autodrive-consumes-authority.md`.
          */
         var post_hypo_delivery: org.json.JSONObject? = null,
+        /**
+         * Running share of the delivered insulin the model actually asked for, against the share the
+         * floors added. Observation only; no dose reads it. See `InsulinOriginMeter`.
+         */
+        var insulin_origin: JSONObject? = null,
     )
 
     data class T3cRuntimeOwnershipExport(
@@ -695,6 +819,36 @@ internal data class AimiDecisionContext(
             base.put("isf_age_ms", baseline_state.isf_age_ms ?: org.json.JSONObject.NULL)
             base.put("isf_cache_key", baseline_state.isf_cache_key ?: org.json.JSONObject.NULL)
             base.put("isf_cache_glucose_mgdl", baseline_state.isf_cache_glucose_mgdl ?: org.json.JSONObject.NULL)
+            base.put("isf_calc_path", baseline_state.isf_calc_path ?: org.json.JSONObject.NULL)
+            base.put("isf_cache_size", baseline_state.isf_cache_size ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_median_mgdl", baseline_state.isf_obs_median_mgdl ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_night_median_mgdl", baseline_state.isf_obs_night_median_mgdl ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_day_median_mgdl", baseline_state.isf_obs_day_median_mgdl ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_window_count", baseline_state.isf_obs_window_count ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_night_count", baseline_state.isf_obs_night_count ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_day_count", baseline_state.isf_obs_day_count ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_last_window_end_ms", baseline_state.isf_obs_last_window_end_ms ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_last_window_mgdl", baseline_state.isf_obs_last_window_mgdl ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_last_window_drop_mgdl", baseline_state.isf_obs_last_window_drop_mgdl ?: org.json.JSONObject.NULL)
+            base.put("isf_obs_last_window_absorbed_u", baseline_state.isf_obs_last_window_absorbed_u ?: org.json.JSONObject.NULL)
+            base.put("late_fat_damping_window", baseline_state.late_fat_damping_window ?: org.json.JSONObject.NULL)
+            base.put("late_fat_rise_flag", baseline_state.late_fat_rise_flag ?: org.json.JSONObject.NULL)
+            base.put("late_fat_onset_age_min", baseline_state.late_fat_onset_age_min ?: org.json.JSONObject.NULL)
+            base.put("harmonia_cf_rule", baseline_state.harmonia_cf_rule ?: org.json.JSONObject.NULL)
+            base.put("harmonia_cf_action", baseline_state.harmonia_cf_action ?: org.json.JSONObject.NULL)
+            base.put("harmonia_cf_basal_uph", baseline_state.harmonia_cf_basal_uph ?: org.json.JSONObject.NULL)
+            base.put("harmonia_cf_changes_proposal", baseline_state.harmonia_cf_changes_proposal ?: org.json.JSONObject.NULL)
+            base.put("harmonia_block_was_escalation", baseline_state.harmonia_block_was_escalation ?: org.json.JSONObject.NULL)
+            base.put("harmonia_block_delta_uph", baseline_state.harmonia_block_delta_uph ?: org.json.JSONObject.NULL)
+            base.put("harmonia_block_stake_u", baseline_state.harmonia_block_stake_u ?: org.json.JSONObject.NULL)
+            base.put("harmonia_applied_gap_uph", baseline_state.harmonia_applied_gap_uph ?: org.json.JSONObject.NULL)
+            base.put("harmonia_verdict_critical_safety", baseline_state.harmonia_verdict_critical_safety ?: org.json.JSONObject.NULL)
+            base.put("harmonia_verdict_context_suppress", baseline_state.harmonia_verdict_context_suppress ?: org.json.JSONObject.NULL)
+            base.put("harmonia_verdict_meal_mode", baseline_state.harmonia_verdict_meal_mode ?: org.json.JSONObject.NULL)
+            base.put("harmonia_verdict_known_to_engine", baseline_state.harmonia_verdict_known_to_engine ?: org.json.JSONObject.NULL)
+            base.put("harmonia_prev_blocker", baseline_state.harmonia_prev_blocker ?: org.json.JSONObject.NULL)
+            base.put("harmonia_prev_blocked_streak", baseline_state.harmonia_prev_blocked_streak ?: org.json.JSONObject.NULL)
+            base.put("harmonia_tree_risk_divergence", baseline_state.harmonia_tree_risk_divergence ?: org.json.JSONObject.NULL)
             base.put("isf_kalman_fast_mgdl", baseline_state.isf_kalman_fast_mgdl ?: org.json.JSONObject.NULL)
             base.put("isf_adj_engine_mgdl", baseline_state.isf_adj_engine_mgdl ?: org.json.JSONObject.NULL)
             base.put("isf_fused_slow_mgdl", baseline_state.isf_fused_slow_mgdl ?: org.json.JSONObject.NULL)
@@ -703,6 +857,7 @@ internal data class AimiDecisionContext(
             base.put("isf_trajectory_multiplier", baseline_state.isf_trajectory_multiplier ?: org.json.JSONObject.NULL)
             base.put("estimated_ra_mgdl_per_min", baseline_state.estimated_ra_mgdl_per_min ?: org.json.JSONObject.NULL)
             base.put("physio_isf_factor", baseline_state.physio_isf_factor ?: org.json.JSONObject.NULL)
+            base.put("isf_pre_floor_mgdl", baseline_state.isf_pre_floor_mgdl ?: org.json.JSONObject.NULL)
             base.put("isf_profile_relative_shadow_mgdl", baseline_state.isf_profile_relative_shadow_mgdl ?: org.json.JSONObject.NULL)
             base.put("isf_profile_relative_bound_hit", baseline_state.isf_profile_relative_bound_hit ?: org.json.JSONObject.NULL)
             base.put("sensitivity_ratio_r", baseline_state.sensitivity_ratio_r ?: org.json.JSONObject.NULL)
@@ -968,6 +1123,9 @@ internal data class AimiDecisionContext(
             adjustments.post_hypo_delivery?.let { postHypoDelivery ->
                 adj.put("post_hypo_delivery", postHypoDelivery)
             }
+            adjustments.insulin_origin?.let { insulinOrigin ->
+                adj.put("insulin_origin", insulinOrigin)
+            }
             json.put("adjustments", adj)
 
             outcome?.let { o ->
@@ -1040,30 +1198,6 @@ private const val MEAL_ADVISOR_MIN_CARB_COVERAGE = 0.25
  * short enough that a genuinely new meal does.
  */
 private const val RISE_FLOOR_REARM_MS = 90L * 60L * 1000L
-
-/**
- * Stable tags naming which branch of the maxSMB ladder picked the ceiling for a tick.
- *
- * Exported as `smb_binding_trace.max_smb_ladder_branch`. The rise floor obeys the ceiling this ladder
- * picks, so the tag is what tells us afterwards whether the ladder saw a rise (a promoted or partial
- * branch) or saw nothing at all (`STANDARD`). The two readings mean very different things.
- *
- * The `_CLAMPED` twins mean the branch fired and the BG below 120 safety clamp then pulled the
- * ceiling back down to the standard preference. Without them the tag would report a promotion that
- * never reached the dose. `STANDARD` has no twin: it already sets the standard preference, so the
- * clamp cannot lower it further.
- */
-private const val LADDER_PLATEAU_CRITICAL = "PLATEAU_CRITICAL_BG250"
-private const val LADDER_PLATEAU_CRITICAL_CLAMPED = "PLATEAU_CRITICAL_BG250_CLAMPED"
-private const val LADDER_CONFIRMED_RISE_HIGH = "CONFIRMED_RISE_HIGH"
-private const val LADDER_CONFIRMED_RISE_HIGH_CLAMPED = "CONFIRMED_RISE_HIGH_CLAMPED"
-private const val LADDER_SENSITIVE_85 = "SENSITIVE_85"
-private const val LADDER_SENSITIVE_85_CLAMPED = "SENSITIVE_85_CLAMPED"
-private const val LADDER_PLATEAU_MODERATE_75 = "PLATEAU_MODERATE_75"
-private const val LADDER_PLATEAU_MODERATE_75_CLAMPED = "PLATEAU_MODERATE_75_CLAMPED"
-private const val LADDER_FALLING_60 = "FALLING_60"
-private const val LADDER_FALLING_60_CLAMPED = "FALLING_60_CLAMPED"
-private const val LADDER_STANDARD = "STANDARD"
 
 private const val TIGHT_SPIRAL_CAP_TDD_REFERENCE_U = 55.0
 
@@ -1278,6 +1412,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     private val profileUtil: ProfileUtil,
     private val fabricPrivacy: FabricPrivacy,
     private val preferences: Preferences,
+    private val pkPdLearnedState: PkPdLearnedState,
     private val gestationalAutopilot: app.aaps.plugins.aps.openAPSAIMI.advisor.gestation.GestationalAutopilot,
     private val auditorOrchestrator: app.aaps.plugins.aps.openAPSAIMI.advisor.auditor.AuditorOrchestrator,
     private val uiInteraction: UiInteraction,
@@ -1327,6 +1462,24 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     @Inject lateinit var contextInfluenceEngine: app.aaps.plugins.aps.openAPSAIMI.context.ContextInfluenceEngine  // 🎯 Context Influence
     @Inject lateinit var physioAdapter: app.aaps.plugins.aps.openAPSAIMI.physio.AIMIInsulinDecisionAdapterMTR  // 🏥 Physiological Modulation
     @Inject lateinit var straightLineTubeAdvisor: StraightLineTubeAdvisor  // 📐 MPC-lite hypo tube + SMB-cap smoothing
+    /**
+     * Passive reference instrument. It measures the sensitivity the outcomes imply and writes it to
+     * `baseline_state` only. It is a plain private field on purpose: not @Inject, not @Singleton, so
+     * nothing else can reach it. Any new call site is a bug. See `ObservedSensitivityMeter`.
+     */
+    private val observedSensitivityMeter = ObservedSensitivityMeter()
+
+    /**
+     * Passive reference instrument. It measures which share of the delivered insulin the model
+     * really asked for, and which share the floors added under it, and writes the answer to
+     * `adjustments.insulin_origin` only.
+     *
+     * **Only the export stage may reach it.** It is a plain private field on purpose: not @Inject,
+     * not @Singleton, so nothing else can. Any other call site is a bug — it would mean a dose
+     * depends on a passive instrument. See `InsulinOriginMeter`.
+     */
+    private val insulinOriginMeter = InsulinOriginMeter()
+
     @Inject lateinit var sensitivityRatioEstimator: SensitivityRatioEstimator
     @Inject lateinit var continuousStateEstimator: app.aaps.plugins.aps.openAPSAIMI.autodrive.estimator.ContinuousStateEstimator
     @Inject lateinit var tpoOrchestrator: TpoOrchestrator
@@ -1814,6 +1967,12 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         }
     }
     private var lateFatRiseFlag: Boolean = false
+
+    /**
+     * Last value the `isLateFatProteinRise` predicate produced this tick, kept only so the export
+     * can compare it with the shadow damping window. Never read by the dosing chain.
+     */
+    private var lateFatRiseFlagForExport: Boolean = false
     // — Hystérèse anti-pompage —
     private val HYPO_RELEASE_MARGIN   = 5.0      // mg/dL au-dessus du seuil
     private val HYPO_RELEASE_HOLD_MIN = 5        // minutes à rester > seuil+margin
@@ -1996,6 +2155,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         // empty trace, and a reader could not tell. Null means "the ladder did not run this tick".
         lastMaxSmbLadderBranch = null
         lastSlopeFromMinDeviation = null
+        lastShortAvgDeltaAtLadder = null
         // Effort reduction telemetry is per tick — a basal-only tick must export null, not the last
         // SMB tick's multiplier.
         lastEffortSmbFactorRaw = null
@@ -2080,6 +2240,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 isf_age_ms = IsfSourceTelemetry.lastAgeMs,
                 isf_cache_key = IsfSourceTelemetry.lastCacheKey,
                 isf_cache_glucose_mgdl = IsfSourceTelemetry.lastCacheGlucoseMgdl,
+                isf_calc_path = IsfSourceTelemetry.lastCalcPath,
+                isf_cache_size = IsfSourceTelemetry.lastCacheSize,
                 isf_kalman_fast_mgdl = IsfSourceTelemetry.lastKalmanFastIsf,
                 isf_adj_engine_mgdl = IsfSourceTelemetry.lastIsfAdjEngine,
                 isf_fused_slow_mgdl = IsfSourceTelemetry.lastFusedSlowIsf,
@@ -2088,6 +2250,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 isf_trajectory_multiplier = IsfSourceTelemetry.lastTrajectoryMultiplier,
                 estimated_ra_mgdl_per_min = runCatching { continuousStateEstimator.getLastRa() }.getOrNull(),
                 physio_isf_factor = IsfSourceTelemetry.lastPhysioIsfFactor,
+                isf_pre_floor_mgdl = CommandedIsf.lastPreFloorMgdlPerU,
                 isf_profile_relative_shadow_mgdl = IsfSourceTelemetry.lastProfileRelativeShadowMgdl,
                 isf_profile_relative_bound_hit = IsfSourceTelemetry.lastProfileRelativeBoundHit,
                 sensitivity_ratio_r = runCatching { sensitivityRatioEstimator.ratio }.getOrNull(),
@@ -2348,7 +2511,6 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             predictedBgMgdl = glucoseStatus.glucose,
             targetBgMgdl = ctx.profile.target_bg,
         )
-        val singleLearnPath = preferences.get(BooleanKey.OApsAIMIIntelligenceSingleLearnPath)
         this.cachedPkpdRuntime = try {
             pkpdIntegration.setRecentBolusSamples(
                 buildRecentPkpdBolusSamples(
@@ -2375,7 +2537,13 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 estimatedRaMgdlPerMin = continuousStateEstimator.getLastRa().takeIf { it.isFinite() && it > 0.0 },
                 causalStatePosterior = lastPatientState?.causalPosterior,
                 patientEventMemory = lastPatientState?.eventMemory,
-                allowLearning = !singleLearnPath,
+                // Read-only by design: signal-prep is the only learning path per tick. This early
+                // call uses a substitute TDD (max basal x 24), so letting it learn would pollute the
+                // shared learned state.
+                allowLearning = false,
+                // Substitute TDD (max basal x 24): read-only for the slew limiter too, otherwise
+                // this call would pin the whole tick on a lower-quality input.
+                isfRateLimitAuthority = false,
             )
         } catch (e: Exception) {
             consoleError.add("❌ Early PKPD Runtime init failed: ${e.message}")
@@ -2605,65 +2773,49 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         // Solution: Use maxSMBHB if EITHER:
         //   1. Active rise detected (slope >= 1.0) - Original logic
         //   2. High plateau (BG >= 250) - NEW, regardless of slope
-        // The rise floor obeys whichever ceiling this ladder picks, so remember the branch and the
-        // slope it read. Both go out in `smb_binding_trace` so the next package can say whether the
-        // ladder we now trust is reading the rise correctly.
+        // The rise floor obeys whichever ceiling this ladder picks, so remember the branch and both
+        // rise signals it read. All three go out in `smb_binding_trace` so the next package can say
+        // whether the ladder we now trust is reading the rise correctly.
         this.lastSlopeFromMinDeviation = ctx.mealData.slopeFromMinDeviation.takeIf { it.isFinite() }
-        this.maxSMB = when {
-            // 🚨 CRITICAL PLATEAU: BG >= 250, regardless of slope
-            // Absolute emergency if BG catastrophic, even with low delta
-            // Protection: Don't apply if rapid fall (delta <= -5)
-            bg >= 250 && combinedDelta > -5.0 -> {
-                this.lastMaxSmbLadderBranch = LADDER_PLATEAU_CRITICAL
-                consoleLog.add("MAXSMB_PLATEAU_CRITICAL BG=${bg.roundToInt()} Δ=${String.format("%.1f", combinedDelta)} slope=${String.format("%.2f", ctx.mealData.slopeFromMinDeviation)} -> maxSMBHB=${String.format("%.2f", maxSMBHB)}U (plateau)")
-                maxSMBHB
-            }
+        this.lastShortAvgDeltaAtLadder = glucoseStatus.shortAvgDelta.takeIf { it.isFinite() }
+        // Trap: `this.shortAvgDelta` is only copied from `glucoseStatus` further down this method,
+        // so reading the bare member here would read the PREVIOUS tick. Always pass
+        // `glucoseStatus.shortAvgDelta`.
+        val ladder = MaxSmbLadder.decide(
+            bgMgdl = bg,
+            combinedDelta = combinedDelta.toDouble(),
+            slopeFromMinDeviation = ctx.mealData.slopeFromMinDeviation,
+            shortAvgDeltaMgdl5m = glucoseStatus.shortAvgDelta,
+            honeymoon = honeymoon,
+            maxSmb = this.maxSMB,
+            maxSmbHighBg = this.maxSMBHB,
+        )
+        this.lastMaxSmbLadderBranch = ladder.branch
+        consoleLog.add(
+            when (ladder.branch) {
+                MaxSmbLadder.LADDER_PLATEAU_CRITICAL     ->
+                    "MAXSMB_PLATEAU_CRITICAL BG=${bg.roundToInt()} Δ=${String.format("%.1f", combinedDelta)} slope=${String.format("%.2f", ctx.mealData.slopeFromMinDeviation)} -> maxSMBHB=${String.format("%.2f", maxSMBHB)}U (plateau)"
 
-            // 🔴 ACTIVE RISE HIGH: BG >= 140 (meal interception zone)
-            // Full maxSMBHB for confirmed meal/resistance in elevated range
-            // Added combinedDelta check to confirm rise is real
-            (bg >= 140 && !honeymoon && ctx.mealData.slopeFromMinDeviation >= 1.0 && combinedDelta > 0.5) ||
-            (bg >= 180 && honeymoon && ctx.mealData.slopeFromMinDeviation >= 1.4 && combinedDelta > 0.5) -> {
-                this.lastMaxSmbLadderBranch = LADDER_CONFIRMED_RISE_HIGH
-                consoleLog.add("MAXSMB_SLOPE_HIGH BG=${bg.roundToInt()} slope=${String.format("%.2f", ctx.mealData.slopeFromMinDeviation)} \u0394=${String.format("%.1f", combinedDelta)} -> maxSMBHB=${String.format("%.2f", maxSMBHB)}U (confirmed rise)")
-                maxSMBHB
-            }
+                MaxSmbLadder.LADDER_CONFIRMED_RISE_HIGH  ->
+                    "MAXSMB_SLOPE_HIGH BG=${bg.roundToInt()} slope=${String.format("%.2f", ctx.mealData.slopeFromMinDeviation)} Δ=${String.format("%.1f", combinedDelta)} -> maxSMBHB=${String.format("%.2f", maxSMBHB)}U (confirmed rise)"
 
-            // 🟡 ACTIVE RISE SENSITIVE: BG 120-140 (near target zone)
-            // 85% maxSMBHB for extra caution close to target
-            // Added combinedDelta check to confirm rise is real
-            bg >= 120 && bg < 140 && !honeymoon && ctx.mealData.slopeFromMinDeviation >= 1.0 && combinedDelta > 0.5 -> {
-                this.lastMaxSmbLadderBranch = LADDER_SENSITIVE_85
-                val partial = max(maxSMB, maxSMBHB * 0.85)
-                consoleLog.add("MAXSMB_SLOPE_SENSITIVE BG=${bg.roundToInt()} slope=${String.format("%.2f", ctx.mealData.slopeFromMinDeviation)} \u0394=${String.format("%.1f", combinedDelta)} -> ${String.format("%.2f", partial)}U (85% maxSMBHB - confirmed rise)")
-                partial
-            }
+                MaxSmbLadder.LADDER_CONFIRMED_RISE_HIGH_BY_DELTA ->
+                    "MAXSMB_DELTA_HIGH BG=${bg.roundToInt()} shortAvgDelta=${String.format("%.2f", glucoseStatus.shortAvgDelta)} slope=${String.format("%.2f", ctx.mealData.slopeFromMinDeviation)} Δ=${String.format("%.1f", combinedDelta)} -> maxSMBHB=${String.format("%.2f", maxSMBHB)}U (confirmed rise by delta)"
 
-            // 🟠 MODERATE PLATEAU: BG 200-250, stable delta
-            // Compromise: 75% of maxSMBHB for elevated but not critical BG
-            bg >= 200 && bg < 250 && combinedDelta > -3.0 && combinedDelta < 3.0 -> {
-                this.lastMaxSmbLadderBranch = LADDER_PLATEAU_MODERATE_75
-                val partial = max(maxSMB, maxSMBHB * 0.75)
-                consoleLog.add("MAXSMB_PLATEAU_MODERATE BG=${bg.roundToInt()} Δ=${String.format("%.1f", combinedDelta)} -> ${String.format("%.2f", partial)}U (75% maxSMBHB)")
-                partial
-            }
+                MaxSmbLadder.LADDER_SENSITIVE_85         ->
+                    "MAXSMB_SLOPE_SENSITIVE BG=${bg.roundToInt()} slope=${String.format("%.2f", ctx.mealData.slopeFromMinDeviation)} Δ=${String.format("%.1f", combinedDelta)} -> ${String.format("%.2f", ladder.ceilingU)}U (85% maxSMBHB - confirmed rise)"
 
-            // 🔵 FALLING PROTECTION: BG elevated but falling moderately
-            // Partial limit to avoid over-correction while still allowing some action
-            bg > 180 && combinedDelta <= -3.0 && combinedDelta > -8.0 -> {
-                this.lastMaxSmbLadderBranch = LADDER_FALLING_60
-                val partial = max(maxSMB, maxSMBHB * 0.6)
-                consoleLog.add("MAXSMB_FALLING BG=${bg.roundToInt()} Δ=${String.format("%.1f", combinedDelta)} -> ${String.format("%.2f", partial)}U (60% maxSMBHB)")
-                partial
-            }
+                MaxSmbLadder.LADDER_PLATEAU_MODERATE_75  ->
+                    "MAXSMB_PLATEAU_MODERATE BG=${bg.roundToInt()} Δ=${String.format("%.1f", combinedDelta)} -> ${String.format("%.2f", ladder.ceilingU)}U (75% maxSMBHB)"
 
-            // ⚪ STANDARD: Normal/low BG conditions
-            else -> {
-                this.lastMaxSmbLadderBranch = LADDER_STANDARD
-                consoleLog.add("MAXSMB_STANDARD BG=${bg.roundToInt()} -> ${String.format("%.2f", maxSMB)}U")
-                maxSMB
+                MaxSmbLadder.LADDER_FALLING_60           ->
+                    "MAXSMB_FALLING BG=${bg.roundToInt()} Δ=${String.format("%.1f", combinedDelta)} -> ${String.format("%.2f", ladder.ceilingU)}U (60% maxSMBHB)"
+
+                else                                     ->
+                    "MAXSMB_STANDARD BG=${bg.roundToInt()} -> ${String.format("%.2f", ladder.ceilingU)}U"
             }
-        }
+        )
+        this.maxSMB = ladder.ceilingU
 
         // 🔒 SAFETY CLAMP: Force Standard MaxSMB if < 120
         // User Rule: "lowbg when < 120". No bypass allowed.
@@ -2673,12 +2825,16 @@ class DetermineBasalaimiSMB2 @Inject constructor(
              // The exported branch tag must show that the clamp won, otherwise the tag reports a
              // promotion that never reached the dose.
              this.lastMaxSmbLadderBranch = when (this.lastMaxSmbLadderBranch) {
-                 LADDER_PLATEAU_CRITICAL    -> LADDER_PLATEAU_CRITICAL_CLAMPED
-                 LADDER_CONFIRMED_RISE_HIGH -> LADDER_CONFIRMED_RISE_HIGH_CLAMPED
-                 LADDER_SENSITIVE_85        -> LADDER_SENSITIVE_85_CLAMPED
-                 LADDER_PLATEAU_MODERATE_75 -> LADDER_PLATEAU_MODERATE_75_CLAMPED
-                 LADDER_FALLING_60          -> LADDER_FALLING_60_CLAMPED
-                 else                       -> LADDER_STANDARD
+                 MaxSmbLadder.LADDER_PLATEAU_CRITICAL    -> MaxSmbLadder.LADDER_PLATEAU_CRITICAL_CLAMPED
+                 MaxSmbLadder.LADDER_CONFIRMED_RISE_HIGH -> MaxSmbLadder.LADDER_CONFIRMED_RISE_HIGH_CLAMPED
+
+                 MaxSmbLadder.LADDER_CONFIRMED_RISE_HIGH_BY_DELTA ->
+                     MaxSmbLadder.LADDER_CONFIRMED_RISE_HIGH_BY_DELTA_CLAMPED
+
+                 MaxSmbLadder.LADDER_SENSITIVE_85        -> MaxSmbLadder.LADDER_SENSITIVE_85_CLAMPED
+                 MaxSmbLadder.LADDER_PLATEAU_MODERATE_75 -> MaxSmbLadder.LADDER_PLATEAU_MODERATE_75_CLAMPED
+                 MaxSmbLadder.LADDER_FALLING_60          -> MaxSmbLadder.LADDER_FALLING_60_CLAMPED
+                 else                                    -> MaxSmbLadder.LADDER_STANDARD
              }
              consoleLog.add("🔒 STRICT CLAMP: BG<120 -> Forced Standard MaxSMB (${String.format("%.2f", stdMaxSMB)}U)")
         }
@@ -3682,6 +3838,10 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                         it.enabled && it.applicationMode == EndocrineApplicationMode.APPLIED
                     }
                     ?.effectiveBasalAmp,
+                // Carried for the export and the counterfactual only. The decision engine does not
+                // read these two, and a test locks that down.
+                priorRuntimeBlocker = harmoniaPrevRuntimeBlocker,
+                priorBlockedStreak = harmoniaBlockedStreak,
             )
         }
         val harmoniaDecision = HarmoniaDecisionEngine.evaluate(
@@ -5146,6 +5306,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             put("system_evolution", d.systemEvolution)
             put("si_metabolic", d.siMetabolic)
             put("fully_suspended", d.fullySuspended)
+            put("anchor_is_dynamic_isf", d.anchorIsDynamicIsf)
             d.safeU?.let { put("safe_u", it) }
         }
     }
@@ -5453,6 +5614,12 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 originOwner = "AutodriveV3",
                 modelOutputU = v3SmbModel,
                 mpcOutputU = v3SmbModel,
+                // Read here and not earlier: `lastMpcRawSmbU` is written inside `tick()`, exactly
+                // like the barrier fields read by `markHtrRaFloorForExport` a few lines above. Read
+                // before the call it would still hold the previous tick's request. Ticks that do
+                // not engage Autodrive never reach this line, so the field stays null there —
+                // "not known", which is what the barrier-zero case needs to be told apart from.
+                mpcRequestedU = autodriveEngine.lastMpcRawSmbU.takeIf { it.isFinite() },
                 tier = v3FloorTier,
                 smallPrebolusPrefU = smallPrebolusPref,
                 largePrebolusPrefU = largePrebolusPref,
@@ -9026,7 +9193,10 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         val physioMults = lastFusedPhysioMultipliers ?: lastBasePhysioMultipliers
         val learningDiagnostics = PkpdLearningDiagnostics.from(
             causalStatePosterior = lastPatientState?.causalPosterior,
-            allowLearning = preferences.get(BooleanKey.OApsAIMIIntelligenceSingleLearnPath),
+            // Signal-prep is the one learning path of the tick and it always learns, so the
+            // snapshot must say so. Reading the preference here reported "read_only_path" while
+            // learning was in fact running.
+            allowLearning = true,
             exerciseFlag = sportTime,
             iobU = ctx.iobDataArray.firstOrNull()?.iob ?: 0.0,
             carbsActiveG = ctx.mealData.mealCOB,
@@ -9098,6 +9268,104 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                     lastBolusMs = ctx.iobDataArray.firstOrNull()?.lastBolusTime ?: 0L,
                 ),
             )
+        }
+
+        // Reference measurement, strictly passive. It rebuilds the sensitivity the outcomes imply,
+        // -dBG / absorbed insulin over clean falls, outside the ISF chain. No dosing decision reads
+        // it: it only reaches baseline_state, next to command_isf_mgdl, so the two can be compared.
+        runCatching {
+            val tickCalendar = Calendar.getInstance()
+            tickCalendar.timeInMillis = decisionCtx.timestamp
+            val runningTempForMeter = ctx.currentTemp
+            observedSensitivityMeter.observe(
+                ObservedSensitivityMeter.Sample(
+                    timestampMs = decisionCtx.timestamp,
+                    localHourOfDay = tickCalendar.get(Calendar.HOUR_OF_DAY),
+                    bgMgdl = decisionCtx.baseline_state.current_bg_mgdl,
+                    // Net of the profile basal: it goes negative when the loop cuts the basal for a
+                    // long time, which is why the basal integral below is needed.
+                    iobU = decisionCtx.baseline_state.iob_u,
+                    cobG = decisionCtx.baseline_state.cob_g,
+                    smbU = finalResult.units ?: 0.0,
+                    // The basal that ran is the temp in progress, not the rate this tick asks for.
+                    deliveredBasalUph =
+                        if (runningTempForMeter.duration > 0) runningTempForMeter.rate else profile.current_basal,
+                    profileBasalUph = profile.current_basal,
+                    // Previous tick's value. A one-tick lag does not matter for a threshold filter
+                    // over a 30 to 120 minute window. Do not swap this for the "used" field: it is
+                    // only set on the engaged Autodrive branch, so it would be null most of the time
+                    // and the fail-closed rule would reject every window.
+                    raMgdlPerMin = decisionCtx.baseline_state.estimated_ra_mgdl_per_min,
+                    lastBolusMs = ctx.iobDataArray.firstOrNull()?.lastBolusTime ?: 0L,
+                ),
+            )
+            val observed = observedSensitivityMeter.read(decisionCtx.timestamp)
+            decisionCtx.baseline_state.isf_obs_median_mgdl = observed.medianMgdlPerU
+            decisionCtx.baseline_state.isf_obs_night_median_mgdl = observed.nightMedianMgdlPerU
+            decisionCtx.baseline_state.isf_obs_day_median_mgdl = observed.dayMedianMgdlPerU
+            decisionCtx.baseline_state.isf_obs_window_count = observed.windowCount
+            decisionCtx.baseline_state.isf_obs_night_count = observed.nightCount
+            decisionCtx.baseline_state.isf_obs_day_count = observed.dayCount
+            decisionCtx.baseline_state.isf_obs_last_window_end_ms = observed.lastWindow?.endMs
+            decisionCtx.baseline_state.isf_obs_last_window_mgdl = observed.lastWindow?.isfMgdlPerU
+            decisionCtx.baseline_state.isf_obs_last_window_drop_mgdl = observed.lastWindow?.dropMgdl
+            decisionCtx.baseline_state.isf_obs_last_window_absorbed_u = observed.lastWindow?.absorbedU
+        }
+
+        // Shadow only — measurement of the late fat damping window against the old rise predicate.
+        // Nothing downstream reads these three fields; they exist to size the divergence on a real
+        // support package before any wiring is decided.
+        runCatching {
+            decisionCtx.baseline_state.late_fat_damping_window = isLateFatDampingWindow(decisionCtx.timestamp)
+            decisionCtx.baseline_state.late_fat_rise_flag = lateFatRiseFlagForExport
+            decisionCtx.baseline_state.late_fat_onset_age_min =
+                MealAbsorptionMemory.onsetAgeMin(decisionCtx.timestamp)?.roundToInt()
+        }
+
+        // Observation only — the Harmonia counterfactual. It answers two questions and changes
+        // nothing: "would Harmonia propose something else if it were told the safety verdict", and
+        // "how much insulin does the refusal move". The verdict below is a mirror of the real guard;
+        // it is never handed back to the engine, which is what `harmonia_verdict_known_to_engine`
+        // records. See `HarmoniaCounterfactual`.
+        runCatching {
+            val verdict = HarmoniaSafetyVerdict(
+                criticalSafetyZeroed = criticalSafetyZeroedThisTick,
+                contextSuppressSmb = lastContextSuppressSmb,
+                mealModeActive = manualMealModeActive(),
+                guardsEnabled = basalChannelSafetyGuardsActive(),
+            )
+            val counterfactual = HarmoniaCounterfactual.evaluate(
+                simulation = lastHarmoniaDecision,
+                production = lastHarmoniaProductionDecision,
+                verdict = verdict,
+                profileBasalUph = profile.current_basal,
+                appliedRateUph = finalResult.rate,
+                appliedDurationMin = finalResult.duration ?: 30,
+            )
+            decisionCtx.baseline_state.harmonia_cf_rule = counterfactual.rule.name
+            decisionCtx.baseline_state.harmonia_cf_action = counterfactual.counterfactualAction?.name
+            decisionCtx.baseline_state.harmonia_cf_basal_uph = counterfactual.counterfactualBasalUph
+            decisionCtx.baseline_state.harmonia_cf_changes_proposal = counterfactual.changesProposal
+            decisionCtx.baseline_state.harmonia_block_was_escalation = counterfactual.requestWasEscalation
+            decisionCtx.baseline_state.harmonia_block_delta_uph = counterfactual.requestDeltaVsProfileUph
+            decisionCtx.baseline_state.harmonia_block_stake_u = counterfactual.blockStakeU
+            decisionCtx.baseline_state.harmonia_applied_gap_uph = counterfactual.appliedGapUph
+            decisionCtx.baseline_state.harmonia_verdict_critical_safety = verdict.criticalSafetyZeroed
+            decisionCtx.baseline_state.harmonia_verdict_context_suppress = verdict.contextSuppressSmb
+            decisionCtx.baseline_state.harmonia_verdict_meal_mode = verdict.mealModeActive
+            // Hard-coded false: witness of inertia. It stays false for as long as no decision path
+            // reads the verdict. The day one does, this line has to change with it.
+            decisionCtx.baseline_state.harmonia_verdict_known_to_engine = false
+            decisionCtx.baseline_state.harmonia_prev_blocker = harmoniaPrevRuntimeBlocker
+            decisionCtx.baseline_state.harmonia_prev_blocked_streak = harmoniaBlockedStreak
+            val trunkRisk = lastPhysiologicalTreeSnapshot?.trunk?.riskLevel
+            val harmoniaRisk = lastHarmoniaDecision?.decisionBasis?.trunkRisk
+            decisionCtx.baseline_state.harmonia_tree_risk_divergence =
+                if (trunkRisk != null && harmoniaRisk != null && trunkRisk != harmoniaRisk) {
+                    "tronc=${trunkRisk.name}|harmonia=${harmoniaRisk.name}"
+                } else {
+                    null
+                }
         }
 
         decisionCtx.adjustments.dynamic_isf = AimiDecisionContext.DynamicIsf(
@@ -9268,6 +9536,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         val bindingExportDraft = lastSmbBindingTraceDraft.copy(
             maxSmbLadderBranch = lastMaxSmbLadderBranch,
             slopeFromMinDeviation = lastSlopeFromMinDeviation,
+            shortAvgDeltaMgdl5m = lastShortAvgDeltaAtLadder,
         ).appendStage(
             "FINAL",
             bindingFinalU,
@@ -9275,7 +9544,43 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             phase = "EXPORT",
             kind = "OBSERVATION",
         )
-        decisionCtx.adjustments.smb_binding_trace = bindingExportDraft.build(bindingFinalU).toJsonObject()
+        val bindingTrace = bindingExportDraft.build(bindingFinalU)
+        decisionCtx.adjustments.smb_binding_trace = bindingTrace.toJsonObject()
+
+        // Observation only — stamps the origin of this tick's dose on the training row queued
+        // earlier in the same tick. Read here, not at CSV time: the row is built inside the SMB
+        // executor, before the owner fallback and the late caps have run, so reading it there would
+        // report "NONE" on ticks that do have an owner.
+        runCatching {
+            smbTrainingRowBuffer.stampOrigin(
+                tickKey = smbTrainingRowTickKey,
+                smbModelU = bindingTrace.modelOutputU,
+                smbFloorU = bindingTrace.autodriveFloorU,
+                bindingStage = bindingTrace.bindingStage,
+                originOwner = bindingTrace.originOwner,
+                smbMpcRequestedU = bindingTrace.mpcRequestedU,
+            )
+        }
+
+        // Observation only — running share of the delivered insulin the model really asked for.
+        // Placed here on purpose, **after** `bindingExportDraft` is complete: read any earlier and
+        // the model output and the floor of this tick are not both known yet, so the split would be
+        // wrong on exactly the ticks it is meant to describe. See `InsulinOriginMeter`.
+        runCatching {
+            insulinOriginMeter.observe(
+                InsulinOriginMeter.Sample(
+                    timestampMs = decisionCtx.timestamp,
+                    finalU = bindingFinalU,
+                    modelOutputU = bindingExportDraft.modelOutputU,
+                    mpcOutputU = bindingExportDraft.mpcOutputU,
+                    autodriveFloorU = bindingExportDraft.autodriveFloorU,
+                    bindingStage = bindingExportDraft.stages.lastOrNull()?.name,
+                    originOwner = bindingExportDraft.originOwner,
+                ),
+            )
+            decisionCtx.adjustments.insulin_origin =
+                insulinOriginMeter.read(decisionCtx.timestamp).toJsonObject()
+        }
 
         lastAuditorLoopSnapshot?.let { snapshot ->
             decisionCtx.adjustments.auditor_tick = snapshot.toJsonObject()
@@ -9391,6 +9696,18 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         } catch (e: Exception) {
             consoleError.add("Failed to save HORMONITOR event JSON: ${e.message}")
         }
+
+        // Very last thing the stage does, and it must stay last: the export above has already read
+        // `harmoniaPrevRuntimeBlocker`, so updating here is what makes "previous" mean the previous
+        // tick. Move this up and every line would export its own blocker while claiming it is the
+        // one before. Observation only.
+        val nowBlocker = lastHarmoniaProductionDecision?.runtimeBlocker
+        harmoniaBlockedStreak = when {
+            nowBlocker != null && nowBlocker == harmoniaPrevRuntimeBlocker -> harmoniaBlockedStreak + 1
+            nowBlocker != null                                            -> 1
+            else                                                          -> 0
+        }
+        harmoniaPrevRuntimeBlocker = nowBlocker
     }
 
     private fun aimiDecisionsJsonlFile(): File = File(externalDir, "AIMI_Decisions.jsonl")
@@ -9765,6 +10082,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             lastBolusTimeMs = lastBolusTimeMs,
             mealFlags = mealFlags
         )
+        lateFatRiseFlagForExport = lateFatRiseFlag
         val tdd24hStateForPkpd = determineBasalInvocationCaches.getTdd24hTotalAmountState(tddCalculator)
         logInvocationCacheState("TDD24H_PKPD", tdd24hStateForPkpd)
         var tdd24Hrs = tdd24hStateForPkpd.valueOrNull()?.toFloat() ?: 0.0f
@@ -9821,6 +10139,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 estimatedRaMgdlPerMin = continuousStateEstimator.getLastRa().takeIf { it.isFinite() && it > 0.0 },
                 causalStatePosterior = lastPatientState?.causalPosterior,
                 patientEventMemory = lastPatientState?.eventMemory,
+                // Signal-prep is the one dosing call per tick: it owns both learning and the ISF
+                // slew anchor (isfRateLimitAuthority defaults to allowLearning).
                 allowLearning = true,
             )
         } catch (e: Exception) {
@@ -10336,7 +10656,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             .getOrNull()
     }
     private var csvPrimaryStorageDeniedLogged = false
-    private val pkpdIntegration = PkPdIntegration(preferences)
+    private val pkpdIntegration = PkPdIntegration(preferences, pkPdLearnedState)
     //private val tempFile = File(externalDir, "temp.csv")
     private var bgacc = 0.0
     private var predictedSMB = 0.0f
@@ -10993,6 +11313,15 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     private var lastSlopeFromMinDeviation: Double? = null
 
     /**
+     * The `shortAvgDelta` the ladder read on this tick, mg/dL per 5 min.
+     *
+     * Written next to [lastSlopeFromMinDeviation] so the export carries both numbers the rise branch
+     * looks at. With this field a support package can replay any candidate threshold on the recorded
+     * ticks, without a new build.
+     */
+    private var lastShortAvgDeltaAtLadder: Double? = null
+
+    /**
      * Deltas the end-of-tick safety net feeds the estimator with.
      *
      * Seeded from the tick's own fields and overwritten with the exact values once the Autodrive
@@ -11039,6 +11368,23 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     private var lastSmbProposed: Double = 0.0
     /** Diagnostic-only immutable SMB cap chain, replaced at every tick bootstrap. */
     private var lastSmbBindingTraceDraft = SmbBindingTrace.Draft()
+
+    /**
+     * Holds the SMB training rows until their origin stamp and their realised glucose are known.
+     *
+     * Instrumentation only: it changes when a row reaches `oapsaimiML2_records.csv`, never what the
+     * pump is asked to do. See [app.aaps.plugins.aps.openAPSAIMI.ml.SmbTrainingRowBuffer].
+     */
+    private val smbTrainingRowBuffer = SmbTrainingRowBuffer()
+
+    /**
+     * Tick clock shared by the queued training row and by its origin stamp.
+     *
+     * The row is queued in the middle of the tick and stamped at its end, so both need the same key
+     * to be sure they speak about the same tick. `dateUtil.now()` moves between the two points and
+     * would not match.
+     */
+    private var smbTrainingRowTickKey: Long = 0L
     /** Cross-tick effort-load memory for [EffortActivityBelief]; intentionally NOT reset per tick. */
     private var lastEffortMemory = EffortActivityBelief.Memory()
     private var lastEffortAssessment: EffortActivityBelief.Assessment? = null
@@ -11074,6 +11420,20 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     private var lastMealCertainty: MealCertainty? = null
     private var lastHarmonizerOutcome: HarmoniaHarmonizer.Outcome? = null
     private var lastHarmoniaProductionDecision: HarmoniaProductionDecision? = null
+
+    /**
+     * Runtime blocker that refused Harmonia on the **previous** tick, and how many ticks in a row the
+     * same blocker has refused it.
+     *
+     * Deliberately **not** reset with the other `last*` fields at the start of a tick: a memory that
+     * is cleared every tick is not a memory. Same reason as `lastEffortMemory`, which the reset block
+     * also leaves alone. Both are written at the very end of the export stage, after the export has
+     * already read the previous value, so a tick exports the previous tick and never itself.
+     *
+     * Observation only. Nothing in the dosing chain reads either field.
+     */
+    private var harmoniaPrevRuntimeBlocker: String? = null
+    private var harmoniaBlockedStreak: Int = 0
     private var lastPatientSourceSensor: SourceSensor? = null
     /** Latest IOB surveillance snapshot for JSONL (updated each [finalizeAndCapSMB]). */
     private var lastIobSurveillanceExport: AimiDecisionContext.IobSurveillanceExport? = null
@@ -12835,7 +13195,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             "dateStr, ${SmbRefinementFeatureSchema.csvFeatureNames.joinToString(", ")}, " +
                 "${SmbRefinementFeatureSchema.familyAuditFeatureNames.joinToString(", ")}, " +
                 "${SmbRefinementFeatureSchema.optionalTrainingAuditFeatureNames.joinToString(", ")}, " +
-                "predictedSMB, smbGiven, dynamicPeak, adjustedDia\n"
+                "predictedSMB, smbGiven, dynamicPeak, adjustedDia, " +
+                "${SmbTrainingRowBuffer.ADDED_COLUMN_NAMES.joinToString(", ")}\n"
         val valuesToRecord = "$dateStr," +
             "$bg,$iob,$cob,$delta,$shortAvgDelta,$longAvgDelta," +
             "$tdd7DaysPerHour,$tdd2DaysPerHour,$tddPerHour,$tdd24HrsPerHour," +
@@ -12847,12 +13208,21 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             "${eventMemory.postHyperExhaustionScore},${eventMemory.correctionFragilityScore},$decisionConflictFlags," +
             "$predictedSMB,$smbToGive," +
             "$peakintermediaire,$latestAdjustedDia"
-        appendCsvSafely(
-            primaryFile = csvfile,
-            fallbackFileName = "oapsaimiML2_records.csv",
-            headerRow = headerRow,
-            valuesRow = valuesToRecord,
-        )
+        // The row is queued, not written. Its four origin fields are only complete at the end of the
+        // tick, and its realised glucose only about half an hour later, so it leaves the queue once
+        // its outcome window has closed. This delays when a row appears in the CSV; it does not
+        // change the row itself, the label, or anything the pump is asked to do.
+        val nowMs = smbTrainingRowTickKey.takeIf { it > 0L } ?: dateUtil.now()
+        smbTrainingRowBuffer.fillRealisedOutcomes(nowMs = nowMs, observedBg = bg)
+        smbTrainingRowBuffer.enqueue(timestampMs = nowMs, valuesPrefix = valuesToRecord)
+        smbTrainingRowBuffer.drainWritableRows(nowMs).forEach { readyRow ->
+            appendCsvSafely(
+                primaryFile = csvfile,
+                fallbackFileName = "oapsaimiML2_records.csv",
+                headerRow = headerRow,
+                valuesRow = readyRow,
+            )
+        }
     }
 
     private fun logDataToCsv(predictedSMB: Float, smbToGive: Float) {
@@ -12916,8 +13286,40 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             file.parentFile?.mkdirs()
             file.createNewFile()
             file.appendText(headerRow)
+        } else {
+            upgradeCsvHeaderIfColumnsWereAppended(file, headerRow)
         }
         file.appendText(valuesRow + "\n")
+    }
+
+    /** Files whose header was already compared with the wanted one since the app started. */
+    private val csvHeaderCheckedPaths = mutableSetOf<String>()
+
+    /**
+     * Rewrites the first line of an existing CSV when new columns were appended to the header.
+     *
+     * The header is only written when the file is created, so a file that already exists keeps its
+     * old header for ever. New rows would then carry cells that no reader can name, and both
+     * [app.aaps.plugins.aps.openAPSAIMI.ml.AimiSmbTrainer] and the offline analysis look columns up
+     * by name. The rewrite happens only when the stored header is the start of the wanted one, so a
+     * file with another shape is never touched. Old rows keep their shorter row on purpose: a cell
+     * that is not there reads as absent, never as zero.
+     *
+     * The file is read once per path per app start; after that the path is remembered and skipped.
+     */
+    private fun upgradeCsvHeaderIfColumnsWereAppended(file: File, headerRow: String) {
+        if (!csvHeaderCheckedPaths.add(file.absolutePath)) return
+        runCatching {
+            val wanted = headerRow.trimEnd('\n')
+            val lines = file.readLines(Charsets.UTF_8)
+            val stored = lines.firstOrNull()?.trimEnd('\r') ?: return@runCatching
+            if (stored == wanted) return@runCatching
+            if (!wanted.startsWith("$stored,")) return@runCatching
+            file.writeText((listOf(wanted) + lines.drop(1)).joinToString("\n") + "\n", Charsets.UTF_8)
+            aapsLogger.info(LTag.APS, "CSV header extended in place for ${file.name}")
+        }.onFailure { error ->
+            aapsLogger.warn(LTag.APS, "CSV header upgrade skipped for ${file.name}: ${error.message}")
+        }
     }
 
     fun removeLast200Lines(csvFile: File) {
@@ -15024,6 +15426,30 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         return noMeal && hoursSinceBolus in 2.0..7.0 && rising && highish && lowIOB && cob <= 1.0
     }
 
+    /**
+     * Damping-only sibling of `isLateFatProteinRise`. SHADOW for now: computed and exported, not
+     * wired into any dose. It is deliberately NOT fed to the meal absorption phase engine nor to any
+     * belief layer, because that predicate also drives an SMB floor whose IOB requirement is the
+     * opposite of this one.
+     *
+     * It looks for the late part of an absorption episode while a large insulin stack is already
+     * working, which is where extra SMB overshoots.
+     */
+    private fun isLateFatDampingWindow(nowMs: Long = dateUtil.now()): Boolean {
+        val ageMin = MealAbsorptionMemory.onsetAgeMin(nowMs) ?: return false
+        if (ageMin !in 120.0..420.0) return false
+        if (cob > 1.0f) return false
+        if (mealTime || bfastTime || lunchTime || dinnerTime || highCarbTime) return false
+        val rising = delta >= 1.0f && (shortAvgDelta >= 0.5f || longAvgDelta >= 0.3f)
+        val highish = bg > 130.0 || predictedBg > 140.0f
+        // The stack floor is a STOCK, homogeneous with IOB. maxSMB is a per bolus cap and was the
+        // wrong scale: during the incident IOB was 6 to 10 U against a maxSMB of 0.05 to 1.5.
+        // There is no 24h TDD field on this class, only the hourly rate, so rebuild the stock.
+        val tdd24hU = tdd24HrsPerHour.toDouble() * 24.0
+        val stackFloorU = maxOf(2.0 * basalaimi.toDouble(), 0.15 * tdd24hU, 1.0)
+        return rising && highish && iob >= stackFloorU
+    }
+
 
     private fun neuralnetwork5(
         delta: Float,
@@ -16854,6 +17280,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         smbSealAllowedRaiseCount = 0
         raNetCombinedDelta = shortAvgDelta
         raNetShortAvgDeltaAdj = shortAvgDelta
+        smbTrainingRowTickKey = ctx.currentTime
         val result = try {
             val inner = runDetermineBasalTickInner(ctx)
             observeRaIfNotAlreadyRun(
