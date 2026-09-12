@@ -66,6 +66,7 @@ import app.aaps.plugins.aps.openAPSAIMI.model.DecisionResult
 import app.aaps.plugins.aps.openAPSAIMI.ml.AimiSmbTrainer
 import app.aaps.plugins.aps.openAPSAIMI.ml.SmbRefinementFeatureSchema
 import app.aaps.plugins.aps.openAPSAIMI.ml.SmbTrainingRowBuffer
+import app.aaps.plugins.aps.openAPSAIMI.ml.TrainingCsvHeader
 import app.aaps.plugins.aps.openAPSAIMI.advisor.auditor.AuditorJsonlExport
 import app.aaps.plugins.aps.openAPSAIMI.advisor.auditor.AuditorVerdict
 import app.aaps.plugins.aps.openAPSAIMI.smb.SmbIntervalPolicy
@@ -86,6 +87,7 @@ import app.aaps.plugins.aps.openAPSAIMI.pkpd.DiaGovernor
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.InsulinKineticsAuthority
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkpdLearningDiagnostics
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.TapSitePeakShift
+import app.aaps.plugins.aps.openAPSAIMI.pkpd.TrajectoryRuntimeRepository
 import app.aaps.plugins.aps.openAPSAIMI.orchestration.AimiIntelligenceSnapshot
 import app.aaps.plugins.aps.openAPSAIMI.orchestration.AimiIntelligenceSnapshotBuilder
 import app.aaps.plugins.aps.openAPSAIMI.orchestration.AimiAdaptationStatusBuilder
@@ -197,6 +199,7 @@ import app.aaps.plugins.aps.openAPSAIMI.safety.CompressionReboundGuard
 import app.aaps.plugins.aps.openAPSAIMI.safety.HypoTools
 import app.aaps.plugins.aps.openAPSAIMI.safety.InsulinStackingStance
 import app.aaps.plugins.aps.openAPSAIMI.safety.SafetyDecision
+import app.aaps.plugins.aps.openAPSAIMI.smb.DescentRedoseGuard
 import app.aaps.plugins.aps.openAPSAIMI.smb.MaxSmbLadder
 import app.aaps.plugins.aps.openAPSAIMI.smb.SmbDampingUsecase
 import app.aaps.plugins.aps.openAPSAIMI.smb.SmbInstructionExecutor
@@ -464,6 +467,21 @@ internal data class AimiDecisionContext(
          * field could say while the shadow witness was reading the already-floored value.
          */
         val isf_pre_floor_mgdl: Double? = null,
+        /**
+         * Stress-ISF-floor signature of the tick: does it hold, and why.
+         *
+         * Written on every tick whether `BooleanKey.OApsAIMIStressIsfFloor` is armed or not, so the
+         * gesture can be measured before it is armed. See `StressIsfFloor`.
+         */
+        val stress_isf_floor_active: Boolean? = null,
+        val stress_isf_floor_reason: String? = null,
+        /**
+         * Sensitivity that would be commanded with the floor at 1.0 x profile, mg/dL per U.
+         *
+         * Present only when the signature is active and the floor would really change the value.
+         * Absent otherwise — absent means "nothing to see", not zero.
+         */
+        val stress_isf_floor_isf_mgdl: Double? = null,
         /** Shadow: sensitivity an unconditional exit clamp relative to the profile would command. */
         val isf_profile_relative_shadow_mgdl: Double? = null,
         /** Shadow: true when that clamp would have changed the value. */
@@ -519,6 +537,34 @@ internal data class AimiDecisionContext(
         var cbf_permitted_unfloored_u: Double? = null,
         /** Profile ISF the barrier was handed, so the two above are interpretable. */
         var cbf_profile_isf_mgdl: Double? = null,
+        /**
+         * Whether the Autodrive gate let the MPC run this tick.
+         *
+         * Everything the barrier exports only exists on engaged ticks. Without this the disengaged
+         * ticks are a blank, and a blank reads as "nothing happened" rather than "the gate was shut".
+         */
+        var autodrive_gate_engaged: Boolean? = null,
+        /** Stable token for why the gate opened or stayed shut, for counting. */
+        var autodrive_gate_kind: String? = null,
+        /** The same reason with its live numbers, for reading. */
+        var autodrive_gate_reason: String? = null,
+        /**
+         * Shadow measurement of the descent re-dose guard (`DescentRedoseGuard`).
+         *
+         * Written on every tick that reaches the universal SMB exit, whether
+         * [app.aaps.core.keys.BooleanKey.OApsAIMIDescentRedoseGuard] is on or off. That is the whole
+         * point: the gesture can be counted in production for weeks before it is armed.
+         */
+        var descent_redose_guard_would_block: Boolean? = null,
+        /** Reason token plus its live numbers (peak, peak age, drop, trough, rebound, BG, IOB). */
+        var descent_redose_guard_reason: String? = null,
+        /**
+         * Bolus the guard would have withheld, U.
+         *
+         * Set only when the verdict is "block", so a tick that did not block leaves the field
+         * absent instead of reporting a zero that means nothing.
+         */
+        var descent_redose_guard_withheld_u: Double? = null,
         /**
          * Effort SMB reduction, as actually applied at the universal SMB exit.
          *
@@ -858,6 +904,9 @@ internal data class AimiDecisionContext(
             base.put("estimated_ra_mgdl_per_min", baseline_state.estimated_ra_mgdl_per_min ?: org.json.JSONObject.NULL)
             base.put("physio_isf_factor", baseline_state.physio_isf_factor ?: org.json.JSONObject.NULL)
             base.put("isf_pre_floor_mgdl", baseline_state.isf_pre_floor_mgdl ?: org.json.JSONObject.NULL)
+            base.put("stress_isf_floor_active", baseline_state.stress_isf_floor_active ?: org.json.JSONObject.NULL)
+            base.put("stress_isf_floor_reason", baseline_state.stress_isf_floor_reason ?: org.json.JSONObject.NULL)
+            base.put("stress_isf_floor_isf_mgdl", baseline_state.stress_isf_floor_isf_mgdl ?: org.json.JSONObject.NULL)
             base.put("isf_profile_relative_shadow_mgdl", baseline_state.isf_profile_relative_shadow_mgdl ?: org.json.JSONObject.NULL)
             base.put("isf_profile_relative_bound_hit", baseline_state.isf_profile_relative_bound_hit ?: org.json.JSONObject.NULL)
             base.put("sensitivity_ratio_r", baseline_state.sensitivity_ratio_r ?: org.json.JSONObject.NULL)
@@ -876,6 +925,12 @@ internal data class AimiDecisionContext(
             base.put("cbf_permitted_u", baseline_state.cbf_permitted_u ?: org.json.JSONObject.NULL)
             base.put("cbf_permitted_unfloored_u", baseline_state.cbf_permitted_unfloored_u ?: org.json.JSONObject.NULL)
             base.put("cbf_profile_isf_mgdl", baseline_state.cbf_profile_isf_mgdl ?: org.json.JSONObject.NULL)
+            base.put("autodrive_gate_engaged", baseline_state.autodrive_gate_engaged ?: org.json.JSONObject.NULL)
+            base.put("autodrive_gate_kind", baseline_state.autodrive_gate_kind ?: org.json.JSONObject.NULL)
+            base.put("autodrive_gate_reason", baseline_state.autodrive_gate_reason ?: org.json.JSONObject.NULL)
+            base.put("descent_redose_guard_would_block", baseline_state.descent_redose_guard_would_block ?: org.json.JSONObject.NULL)
+            base.put("descent_redose_guard_reason", baseline_state.descent_redose_guard_reason ?: org.json.JSONObject.NULL)
+            base.put("descent_redose_guard_withheld_u", baseline_state.descent_redose_guard_withheld_u ?: org.json.JSONObject.NULL)
             base.put("effort_smb_factor_requested", baseline_state.effort_smb_factor_requested ?: org.json.JSONObject.NULL)
             base.put("effort_smb_factor_applied", baseline_state.effort_smb_factor_applied ?: org.json.JSONObject.NULL)
             base.put("effort_smb_before_u", baseline_state.effort_smb_before_u ?: org.json.JSONObject.NULL)
@@ -2133,6 +2188,9 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         val gov = basalNeuralLearner.getGovernanceSnapshot()
         put("governance_action", gov.action.name)
         put("governance_basal_floor", gov.activeBasalFloor ?: JSONObject.NULL)
+        // Exported so a stuck HOLD_CONSERVATIVE severe tier is visible directly in the trace, instead of
+        // only in the coordinator's own info-level log line.
+        put("governance_severe_hypo_count", gov.severeHypoCount)
     }
 
     /**
@@ -2251,6 +2309,9 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 estimated_ra_mgdl_per_min = runCatching { continuousStateEstimator.getLastRa() }.getOrNull(),
                 physio_isf_factor = IsfSourceTelemetry.lastPhysioIsfFactor,
                 isf_pre_floor_mgdl = CommandedIsf.lastPreFloorMgdlPerU,
+                stress_isf_floor_active = IsfSourceTelemetry.lastStressIsfFloorActive,
+                stress_isf_floor_reason = IsfSourceTelemetry.lastStressIsfFloorReason,
+                stress_isf_floor_isf_mgdl = IsfSourceTelemetry.lastStressIsfFloorIsfMgdl,
                 isf_profile_relative_shadow_mgdl = IsfSourceTelemetry.lastProfileRelativeShadowMgdl,
                 isf_profile_relative_bound_hit = IsfSourceTelemetry.lastProfileRelativeBoundHit,
                 sensitivity_ratio_r = runCatching { sensitivityRatioEstimator.ratio }.getOrNull(),
@@ -5387,6 +5448,15 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             estimatedRa = continuousStateEstimator.getLastRa(),
             mealChannelHint = lastRbtAppliedHints?.mealChannel,
         )
+
+        // Observation only — recorded for both outcomes, before the branch. The engaged path already
+        // logged its reason to the console; the disengaged path threw it away, so two thirds of a day
+        // had no explanation at all.
+        pendingDecisionCtxForExport?.baseline_state?.let { baseline ->
+            baseline.autodrive_gate_engaged = gate.engage
+            baseline.autodrive_gate_kind = gate.kind.name
+            baseline.autodrive_gate_reason = gate.reason
+        }
 
         if (!gate.engage) {
             // Estimation is unconditional; actuation is gated. Nothing inside the engaged branch
@@ -12494,6 +12564,29 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         return if (minVal == Double.MAX_VALUE) 200.0 else minVal
     }
 
+    /**
+     * Runs [DescentRedoseGuard] on the bucketed glucose table and the current IOB.
+     *
+     * Rows are filtered exactly like [minBgInLastMinutes]: gap fillers and the 39 mg/dL sentinel are
+     * dropped, and the recalculated (smoothed) value is used. Dropping the fillers leaves real holes
+     * in the series, which is what the guard's own gap rule is there to cut on.
+     */
+    private fun evaluateDescentRedoseGuard(): DescentRedoseGuard.Verdict {
+        val data = iobCobCalculator.ads.getBucketedDataTableCopy()
+        val readings = ArrayList<DescentRedoseGuard.Reading>()
+        if (data != null) {
+            for (row in data) {
+                if (row.value <= 39 || row.filledGap) continue
+                readings.add(DescentRedoseGuard.Reading(row.timestamp, row.recalculated))
+            }
+        }
+        return DescentRedoseGuard.evaluate(
+            readings = readings,
+            nowMs = dateUtil.now(),
+            iobU = this.iob.toDouble(),
+        )
+    }
+
     fun appendCompactLog(
         reason: StringBuilder,
         peakTime: Double,
@@ -13191,12 +13284,9 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         val eventMemory = lastPatientState?.eventMemory ?: PatientEventMemory.EMPTY
         val decisionConflictFlags = physioAdapter.getLastDecisionTrace()?.decisionConflictFlags?.joinToString("|").orEmpty()
 
-        val headerRow =
-            "dateStr, ${SmbRefinementFeatureSchema.csvFeatureNames.joinToString(", ")}, " +
-                "${SmbRefinementFeatureSchema.familyAuditFeatureNames.joinToString(", ")}, " +
-                "${SmbRefinementFeatureSchema.optionalTrainingAuditFeatureNames.joinToString(", ")}, " +
-                "predictedSMB, smbGiven, dynamicPeak, adjustedDia, " +
-                "${SmbTrainingRowBuffer.ADDED_COLUMN_NAMES.joinToString(", ")}\n"
+        // One source of truth for the column order: the writer and `AimiSmbTrainer` read the same list.
+        // Building the header here by hand is what let the file on disk drift away from the rows.
+        val headerRow = SmbRefinementFeatureSchema.trainingCsvHeaderLine() + "\n"
         val valuesToRecord = "$dateStr," +
             "$bg,$iob,$cob,$delta,$shortAvgDelta,$longAvgDelta," +
             "$tdd7DaysPerHour,$tdd2DaysPerHour,$tddPerHour,$tdd24HrsPerHour," +
@@ -13287,7 +13377,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             file.createNewFile()
             file.appendText(headerRow)
         } else {
-            upgradeCsvHeaderIfColumnsWereAppended(file, headerRow)
+            ensureCsvHeaderIsCurrent(file, headerRow)
         }
         file.appendText(valuesRow + "\n")
     }
@@ -13296,29 +13386,23 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     private val csvHeaderCheckedPaths = mutableSetOf<String>()
 
     /**
-     * Rewrites the first line of an existing CSV when new columns were appended to the header.
+     * Makes sure an existing CSV carries the header the writer builds today.
      *
-     * The header is only written when the file is created, so a file that already exists keeps its
-     * old header for ever. New rows would then carry cells that no reader can name, and both
-     * [app.aaps.plugins.aps.openAPSAIMI.ml.AimiSmbTrainer] and the offline analysis look columns up
-     * by name. The rewrite happens only when the stored header is the start of the wanted one, so a
-     * file with another shape is never touched. Old rows keep their shorter row on purpose: a cell
-     * that is not there reads as absent, never as zero.
-     *
-     * The file is read once per path per app start; after that the path is remembered and skipped.
+     * The rewrite itself, and why it is safe to replace the first line whatever its old shape, live in
+     * [app.aaps.plugins.aps.openAPSAIMI.ml.TrainingCsvHeader]. Here we only add the two things that
+     * belong to the running app: the file is checked once per path per app start, and any failure is
+     * logged and swallowed, because a header that could not be fixed must never stop a row from being
+     * written.
      */
-    private fun upgradeCsvHeaderIfColumnsWereAppended(file: File, headerRow: String) {
+    private fun ensureCsvHeaderIsCurrent(file: File, headerRow: String) {
         if (!csvHeaderCheckedPaths.add(file.absolutePath)) return
         runCatching {
-            val wanted = headerRow.trimEnd('\n')
-            val lines = file.readLines(Charsets.UTF_8)
-            val stored = lines.firstOrNull()?.trimEnd('\r') ?: return@runCatching
-            if (stored == wanted) return@runCatching
-            if (!wanted.startsWith("$stored,")) return@runCatching
-            file.writeText((listOf(wanted) + lines.drop(1)).joinToString("\n") + "\n", Charsets.UTF_8)
-            aapsLogger.info(LTag.APS, "CSV header extended in place for ${file.name}")
+            val outcome = TrainingCsvHeader.ensureCurrent(file, headerRow)
+            if (outcome == TrainingCsvHeader.Outcome.REPLACED) {
+                aapsLogger.info(LTag.APS, "CSV header replaced in place for ${file.name}")
+            }
         }.onFailure { error ->
-            aapsLogger.warn(LTag.APS, "CSV header upgrade skipped for ${file.name}: ${error.message}")
+            aapsLogger.warn(LTag.APS, "CSV header refresh skipped for ${file.name}: ${error.message}")
         }
     }
 
@@ -14013,6 +14097,31 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             )
             rT.reason.append("🏃effort×${"%.2f".format(Locale.US, effortFactor)} ")
         }
+        // 🛑 Descent re-dose guard — see [app.aaps.plugins.aps.openAPSAIMI.smb.DescentRedoseGuard].
+        // The verdict is ALWAYS computed and exported, so the gesture can be measured in production
+        // long before it is armed. It changes the dose only when the opt-in key is on; with the key
+        // off nothing here writes to finalUnits, the console or the reason, so the tick stays
+        // bit-identical to what it was before this block existed.
+        val descentGuardVerdict = evaluateDescentRedoseGuard()
+        pendingDecisionCtxForExport?.baseline_state?.let { baseline ->
+            baseline.descent_redose_guard_would_block = descentGuardVerdict.block
+            baseline.descent_redose_guard_reason = descentGuardVerdict.reason
+            if (descentGuardVerdict.block) baseline.descent_redose_guard_withheld_u = finalUnits
+        }
+        if (DescentRedoseGuard.shouldWithhold(
+                verdict = descentGuardVerdict,
+                armed = preferences.get(BooleanKey.OApsAIMIDescentRedoseGuard),
+                isExplicitUserAction = isExplicitUserAction,
+                proposedUnits = finalUnits,
+            )
+        ) {
+            consoleLog.add(
+                "🛑 DESCENT_REDOSE_GUARD: ${"%.2f".format(Locale.US, finalUnits)}→0.00U (${descentGuardVerdict.reason})",
+            )
+            rT.reason.append("🛑descent re-dose ")
+            finalUnits = 0.0
+        }
+
         // Charge the SlowCarbMeal early-window budget with the ACTUAL delivered amount (post-effort).
         if (chargeSlowCarbBudget && finalUnits > 0.0) slowCarbBudgetDeliveredU += finalUnits
         chainFinal = finalUnits
@@ -17781,6 +17890,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         min_bg = pkpdTargetsMinBg
         target_bg = pkpdTargetsTargetBg
         max_bg = pkpdTargetsMaxBg
+        this.lastAdvancedPredictionCurves?.let { TrajectoryRuntimeRepository.publish(it) }
         val modelcal = runUamModelCalHypoGuardPostHypoAndSetPredictedSmb(
             rT = rT,
             bg = bg,

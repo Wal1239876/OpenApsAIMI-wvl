@@ -31,6 +31,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -155,8 +156,11 @@ fun MainScreen(
     onDismissSearchHardwarePump: () -> Unit,
     /** When true, overview uses the ring glucose hero instead of the flat BG circle (Compose overview only). */
     useRingHeroHome: Boolean = false,
-    /** When non-null, replaces [OverviewScreen] with the embedded AIMI hybrid [app.aaps.plugins.main.general.dashboard.DashboardFragment]. */
+    /** When non-null, replaces [OverviewScreen] with an embedded dashboard supplied by the app module. */
     dashboardOverview: (@Composable (PaddingValues, Dp) -> Unit)? = null,
+    /** True only for the GLASS dashboard skin — swaps in [GlassNavigationBar] instead of the default
+     *  [MainNavigationBar]. Does not affect OVERVIEW/DASHBOARD_V1, which keep using MainNavigationBar. */
+    isGlassSkin: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     LocalDateUtil.current
@@ -242,7 +246,9 @@ fun MainScreen(
                 Scaffold(
                     snackbarHost = { SnackbarHost(snackbarHostState) },
                 ) { scaffoldPadding ->
-                    val hasToolbar = quickLaunchItems.isNotEmpty()
+                    // Glass has its own quick-shortcut pills and its own bottom nav — the general-purpose
+                    // Quick Launch toolbar would just float on top of them, redundant with Glass's design.
+                    val hasToolbar = quickLaunchItems.isNotEmpty() && !isGlassSkin
 
                     // Content padding: in preview mode use only system bars;
                     // in normal mode add measured bar heights
@@ -264,7 +270,6 @@ fun MainScreen(
                     Box(modifier = Modifier.fillMaxSize()) {
                         val fabBottomOffset = if (hasToolbar && showChrome) 56.dp else 0.dp
 
-                        // Main content
                         if (dashboardOverview != null) {
                             dashboardOverview(contentPadding, fabBottomOffset)
                         } else {
@@ -425,7 +430,26 @@ fun MainScreen(
                                 .padding(bottom = scaffoldPadding.calculateBottomPadding())
                         ) {
                             val loopActionState = loopActionViewModel.uiState.collectAsStateWithLifecycle().value
-                            MainNavigationBar(
+                            if (isGlassSkin) {
+                                GlassNavigationBar(
+                                    masterOrPairedClient = masterOrPairedClient,
+                                    onTreatmentClick = {
+                                        treatmentViewModel.refreshState()
+                                        showTreatmentSheet = true
+                                    },
+                                    onScenariosClick = {
+                                        scenesViewModel.refreshState()
+                                        showAutomationSheet = true
+                                    },
+                                    onManagementClick = { manageSheetState.show() },
+                                    onNavigate = onNavigate,
+                                    loopActionAvailable = loopActionState.actionAvailable,
+                                    onLoopActionClick = { showLoopActionSheet = true },
+                                    modifier = Modifier.onSizeChanged {
+                                        if (it.height > 0 && it.height != bottomBarHeightPx) bottomBarHeightPx = it.height
+                                    },
+                                )
+                            } else MainNavigationBar(
                                 onManageClick = { manageSheetState.show() },
                                 onTreatmentClick = {
                                     treatmentViewModel.refreshState()
